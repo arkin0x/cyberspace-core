@@ -16,10 +16,14 @@
  *
  * Two seams keep the arithmetic replaceable. A WordKernel does the 61-bit
  * modular work (the prime search, a root modulo one prime, the combine modulo
- * every prime); JS_WORD_KERNEL is the pure JavaScript one, Montgomery with
- * 25-bit limbs in plain numbers, and a WASM kernel can take its place behind
- * the same shape. A BigBackend does the big numbers (the Cantor trees, the
- * product tree of the primes and the remainder tree); BIGINT_BACKEND is
+ * every prime, and optionally whole steps with their hashes); JS_WORD_KERNEL
+ * is the pure JavaScript one, Montgomery with 25-bit limbs in plain numbers,
+ * and WASM_WORD_KERNEL is src/residue/kern.ts compiled (64-bit Montgomery in
+ * WebAssembly, committed as kernWasm.ts). Every function that takes a kernel
+ * defaults to selectWordKernel(): WASM when WebAssembly is there and the
+ * module can be instantiated, JavaScript otherwise. A BigBackend does the big
+ * numbers (the Cantor trees, the product tree of the primes and the remainder
+ * tree); BIGINT_BACKEND is
  * native BigInt, and a GMP adapter can take its place. Every implementation
  * of either MUST give the same values, which the golden vectors check.
  *
@@ -41,6 +45,7 @@ import {
 } from './movement.js'
 import { decodeNonce, encodeNonce, meetsPrice, type NonceSearch } from './sidestep.js'
 import { terrainK } from './terrain.js'
+import { KERN_WASM_BASE64 } from './residue/kernWasm.js'
 
 // ------------------------------------------------------------- constants (5.9)
 
@@ -195,6 +200,21 @@ export interface WordKernel {
    * Every entry of every part is below its prime. Written to entry j of `out`.
    */
   combine(primes: WordList, parts: readonly WordList[], out: WordList): void
+  /*
+   * Whole steps, hashes included, for a kernel that can do them faster than
+   * residue.ts composes them from the four methods above and its own SHA-256.
+   * Each is optional; when a kernel has one it MUST give exactly what the
+   * composition gives (the golden vectors check both).
+   */
+  /** p_0 to p_(m-1) for an id (5.9), m = out.length / 2 (at most 2^53), into `out`: deriveHopPrimes. */
+  hopPrimes?(previousEventId: Uint8Array, out: WordList): void
+  /** One attempt (5.10) for a nonce below 2^64 under a seal: hopAttempt. */
+  attempt?(previousEventId: Uint8Array, seal: Uint8Array, nonce: bigint, p0: bigint): HopAttempt
+  /**
+   * The first nonce in [start, end) whose attempt meets the price `attempts`
+   * (G A < 2^256), with that attempt, or null: one range of findHopNonce.
+   */
+  findNonce?(previousEventId: Uint8Array, seal: Uint8Array, attempts: bigint, p0: bigint, start: bigint, end: bigint): HopNonce | null
 }
 
 /** The product tree over a hop's primes: level 0 the primes, each level up the products of pairs, the top Q. */
@@ -636,6 +656,337 @@ export const JS_WORD_KERNEL: WordKernel = {
   },
 }
 
+// ------------------------------------------------------------- the WASM word kernel
+//
+// src/residue/kern.ts compiled by scripts/build-kernel.mjs and committed as
+// base64 in src/residue/kernWasm.ts, so tsc ships it and no consumer builds or
+// fetches anything. 64-bit Montgomery arithmetic with R = 2^64, SHA-256
+// compressions from midstates, and the whole prime derivation and nonce
+// search inside the module. The module keeps its scratch at fixed addresses
+// below 64 KiB (see kern.ts) and takes the caller's arrays from BUF up, as
+// u64 words in WebAssembly's little-endian order, written through a DataView
+// so nothing here depends on the platform's byte order.
+
+interface KernExports {
+  readonly memory: WebAssembly.Memory
+  searchBatch(inPtr: number, outPtr: number, count: number): void
+  primesBatch(midPtr: number, j0: bigint, count: number, outPtr: number): void
+  residue(p: bigint, baseMod: bigint, h: number, k: number): bigint
+  pairMod(p: bigint, a: bigint, b: bigint): bigint
+  combineBatch(pP: number, px: number, py: number, pz: number, pt: number, out: number, m: number): void
+  combine2Batch(pP: number, pa: number, pb: number, out: number, m: number): void
+  grindSetup(p0: bigint, k: number, a: bigint): void
+  gmidPtr(): number
+  gtailPtr(): number
+  gdomPtr(): number
+  goutPtr(): number
+  gseedPtr(): number
+  gnoncePtr(): number
+  lastRg(): bigint
+  attempt(nonce: bigint): number
+  grind(start: bigint, count: bigint): number
+}
+
+/** Where the caller's arrays start in the module's memory. */
+const KERN_BUF = 1 << 20
+/** Where the prime-derivation midstate goes (scratch, below the engine table). */
+const KERN_PRIME_MID = 128
+/** Entries per batch call, so a hop at any height needs a few MiB of module memory. */
+const KERN_CHUNK = 1 << 16
+/** Attempts per call of the module's grind, between progress reports. */
+const KERN_GRIND_CHUNK = 4096n
+/** The engine level of the attempt's height-12 tree in the module. */
+const KERN_ATTEMPT_LEVEL = 4
+
+const KERN_IMPORTS = { env: { abort: (): never => { throw new Error('the WASM word kernel aborted') } } }
+
+let kern: KernExports | null = null
+let kernLoading: Promise<WordKernel> | null = null
+let kernSyncRefused = false
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+/** The committed module's bytes. Decoded here so it works the same in Node, browsers and workers. */
+export function wasmWordKernelBytes(): Uint8Array {
+  const s = KERN_WASM_BASE64.replace(/=+$/, '')
+  const out = new Uint8Array(Math.floor((s.length * 3) / 4))
+  let acc = 0, bits = 0, at = 0
+  for (let i = 0; i < s.length; i++) {
+    const v = B64.indexOf(s[i])
+    if (v < 0) throw new Error('the committed kernel is not base64')
+    acc = (acc << 6) | v
+    bits += 6
+    if (bits >= 8) { bits -= 8; out[at++] = (acc >> bits) & 255 }
+  }
+  return out
+}
+
+/** The module's bytes in an ArrayBuffer of their own, as WebAssembly takes them. */
+const kernBuffer = (): ArrayBuffer => wasmWordKernelBytes().buffer as ArrayBuffer
+
+const hasWebAssembly = (): boolean => typeof WebAssembly === 'object' && WebAssembly !== null
+
+/**
+ * The module's exports, instantiating it synchronously the first time unless
+ * loadWasmWordKernel() already has. A synchronous compile works in Node, in
+ * workers and in current browsers (Chromium 151 on a page's main thread
+ * included); a browser may still refuse one on a page's main thread (older
+ * Chromium did above 4 KB), and there the caller awaits loadWasmWordKernel().
+ */
+function kernExports(): KernExports {
+  if (kern) return kern
+  if (!hasWebAssembly()) throw new Error('WebAssembly is not available here; use JS_WORD_KERNEL')
+  try {
+    kern = new WebAssembly.Instance(new WebAssembly.Module(kernBuffer()), KERN_IMPORTS).exports as unknown as KernExports
+  } catch (e) {
+    kernSyncRefused = true
+    throw new Error(`the WASM word kernel cannot be instantiated synchronously here (${String(e)}); await loadWasmWordKernel() first`)
+  }
+  return kern
+}
+
+/**
+ * Instantiates the WASM word kernel asynchronously (WebAssembly.instantiate on
+ * the committed bytes; nothing is fetched), which works on every thread of
+ * every runtime that has WebAssembly. Resolves to WASM_WORD_KERNEL, ready; a
+ * second call returns the first's promise. Rejects where WebAssembly is
+ * missing or disabled (iOS Lockdown Mode, some locked-down WebViews), and
+ * then JS_WORD_KERNEL is the kernel to use.
+ */
+export function loadWasmWordKernel(): Promise<WordKernel> {
+  if (kern) return Promise.resolve(WASM_WORD_KERNEL)
+  if (!hasWebAssembly()) return Promise.reject(new Error('WebAssembly is not available here; use JS_WORD_KERNEL'))
+  kernLoading ??= WebAssembly.instantiate(kernBuffer(), KERN_IMPORTS).then(
+    (source) => {
+      kern ??= source.instance.exports as unknown as KernExports
+      return WASM_WORD_KERNEL
+    },
+    (e: unknown) => {
+      kernLoading = null
+      throw e
+    },
+  )
+  return kernLoading
+}
+
+/**
+ * Whether WASM_WORD_KERNEL can run now: instantiated already, or
+ * instantiable synchronously on this thread (tried once).
+ */
+export function wasmWordKernelReady(): boolean {
+  if (kern) return true
+  if (kernSyncRefused || !hasWebAssembly()) return false
+  try {
+    kernExports()
+    return true
+  } catch {
+    return false
+  }
+}
+
+export type WordKernelChoice = 'auto' | 'wasm' | 'js'
+
+/**
+ * The word kernel for a choice: `js` always JS_WORD_KERNEL; `wasm` always
+ * WASM_WORD_KERNEL, throwing when it cannot run here; `auto` (every
+ * function's default) WASM when it can run now and JavaScript otherwise. A
+ * page that wants WASM everywhere awaits loadWasmWordKernel() once at start,
+ * so `auto` finds the module ready even where a synchronous compile is
+ * refused. Both kernels give identical values, so the choice changes only the
+ * speed.
+ */
+export function selectWordKernel(choice: WordKernelChoice = 'auto'): WordKernel {
+  if (choice === 'js') return JS_WORD_KERNEL
+  if (choice === 'wasm') {
+    kernExports()
+    return WASM_WORD_KERNEL
+  }
+  return wasmWordKernelReady() ? WASM_WORD_KERNEL : JS_WORD_KERNEL
+}
+
+/** A DataView over the module's memory with room for `bytes` past KERN_BUF. */
+function kernView(x: KernExports, bytes: number): DataView {
+  const need = KERN_BUF + bytes
+  const have = x.memory.buffer.byteLength
+  if (have < need) x.memory.grow(Math.ceil((need - have) / 65536))
+  return new DataView(x.memory.buffer)
+}
+
+/** Entries [from, from + count) of a word list into the module at `at`, as u64. */
+function putWords(view: DataView, at: number, list: WordList, from: number, count: number): void {
+  for (let j = 0, i = 2 * from; j < count; j++, i += 2) {
+    view.setUint32(at + 8 * j, list[i + 1], true)
+    view.setUint32(at + 8 * j + 4, list[i], true)
+  }
+}
+
+/** `count` u64 values from the module at `at` into entries [from, from + count) of a word list. */
+function getWords(view: DataView, at: number, list: WordList, from: number, count: number): void {
+  for (let j = 0, i = 2 * from; j < count; j++, i += 2) {
+    list[i + 1] = view.getUint32(at + 8 * j, true)
+    list[i] = view.getUint32(at + 8 * j + 4, true)
+  }
+}
+
+/** Big-endian 32-bit words of `bytes` (a multiple of 4) into the module at `at`, as numeric values. */
+function putBigEndianWords(view: DataView, at: number, bytes: Uint8Array): void {
+  const src = new DataView(bytes.buffer, bytes.byteOffset, bytes.length)
+  for (let i = 0; i < bytes.length; i += 4) view.setUint32(at + i, src.getUint32(i), true)
+}
+
+/** `n` numeric words from the module at `at` as big-endian bytes. */
+function getBigEndianBytes(view: DataView, at: number, n: number): Uint8Array {
+  const out = new Uint8Array(4 * n)
+  const dst = new DataView(out.buffer)
+  for (let i = 0; i < n; i++) dst.setUint32(4 * i, view.getUint32(at + 4 * i, true))
+  return out
+}
+
+function checkKernelPrime(p: bigint): void {
+  if (p < TWO_61 || p >= 1n << 62n || (p & 1n) === 0n) throw new Error('the kernel works modulo an odd p in [2^61, 2^62)')
+}
+
+/**
+ * Loads the attempt's fixed parts for one id and seal (5.10): the midstate of
+ * the seed's first block, the seed's second block with the nonce left zero,
+ * the domain of G's first block, p_0 and the price.
+ */
+function kernPrepareAttempts(x: KernExports, previousEventId: Uint8Array, seal: Uint8Array, p0: bigint, attempts: bigint): void {
+  checkPreviousEventId(previousEventId)
+  if (seal.length !== 32) throw new Error('the seal is 32 bytes')
+  checkKernelPrime(p0)
+  const view = kernView(x, 0)
+  const mid = sha256Midstate(concatBytes(HOP_RESIDUE_GRIND_DOMAIN, previousEventId, seal.subarray(0, 1)))
+  for (let i = 0; i < 8; i++) view.setUint32(x.gmidPtr() + 4 * i, mid[i], true)
+  // The seed's 103 bytes end in one block: seal[1..31], be64(nonce), 0x80, zeros, the length in bits.
+  const tail = new Uint8Array(64)
+  tail.set(seal.subarray(1), 0)
+  tail[39] = 0x80
+  new DataView(tail.buffer).setUint32(60, (HOP_RESIDUE_GRIND_DOMAIN.length + 32 + 32 + 8) * 8)
+  putBigEndianWords(view, x.gtailPtr(), tail)
+  const dom = new Uint8Array(32)
+  dom.set(HOP_RESIDUE_GRIND_DOMAIN, 0)
+  putBigEndianWords(view, x.gdomPtr(), dom)
+  x.grindSetup(p0, KERN_ATTEMPT_LEVEL, attempts)
+}
+
+/** The attempt the module just made, read back. */
+function kernLastAttempt(x: KernExports): HopAttempt {
+  const view = kernView(x, 0)
+  const seed = getBigEndianBytes(view, x.gseedPtr(), 8)
+  const gBase = ((bytesToBigInt(seed) & AXIS_MASK) >> BigInt(HOP_GRIND_HEIGHT)) << BigInt(HOP_GRIND_HEIGHT)
+  return { seed, gBase, rG: x.lastRg(), G: getBigEndianBytes(view, x.goutPtr(), 8) }
+}
+
+/**
+ * The WASM word kernel: src/residue/kern.ts, 64-bit Montgomery arithmetic in
+ * WebAssembly, with the prime derivation, the attempt and the nonce search
+ * done whole inside the module. Instantiated on first use (synchronously), or
+ * ahead of time by loadWasmWordKernel(). Gives exactly JS_WORD_KERNEL's
+ * values, several times faster.
+ */
+export const WASM_WORD_KERNEL: WordKernel = {
+  name: 'wasm',
+  searchPrimes(starts, out) {
+    if (out.length !== starts.length) throw new Error('searchPrimes writes one prime per start')
+    const x = kernExports()
+    const m = starts.length / 2
+    for (let j = 0; j < m; j++) {
+      const hi = starts[2 * j], lo = starts[2 * j + 1]
+      if ((lo & 1) === 0 || hi < 2 ** 29 || hi >= 2 ** 30) throw new Error('a prime search starts at an odd number in [2^61, 2^62)')
+    }
+    for (let j0 = 0; j0 < m; j0 += KERN_CHUNK) {
+      const count = Math.min(KERN_CHUNK, m - j0)
+      let view = kernView(x, 16 * count)
+      putWords(view, KERN_BUF, starts, j0, count)
+      x.searchBatch(KERN_BUF, KERN_BUF + 8 * count, count)
+      view = kernView(x, 16 * count)
+      getWords(view, KERN_BUF + 8 * count, out, j0, count)
+    }
+  },
+  rootResidue(p, base, height) {
+    if (!Number.isInteger(height) || height < 0 || height > MAX_RESIDUE_HEIGHT) throw new Error(`residue height ${height} out of range`)
+    if (base < 0n) throw new Error('a base is a natural number')
+    checkKernelPrime(p)
+    const k = height === HOP_GRIND_HEIGHT ? KERN_ATTEMPT_LEVEL : engineLevel(height)
+    return kernExports().residue(p, base % p, height, k)
+  },
+  pairMod(p, a, b) {
+    checkKernelPrime(p)
+    if (a < 0n || b < 0n || a >= p || b >= p) throw new Error('pairMod takes residues below p')
+    return kernExports().pairMod(p, a, b)
+  },
+  combine(primes, parts, out) {
+    const m = primes.length / 2
+    if (parts.length === 0 || parts.some((part) => part.length !== primes.length) || out.length !== primes.length) {
+      throw new Error('combine takes one entry per prime in every part')
+    }
+    const x = kernExports()
+    const n = parts.length
+    for (let j0 = 0; j0 < m; j0 += KERN_CHUNK) {
+      const count = Math.min(KERN_CHUNK, m - j0)
+      const at = (slot: number): number => KERN_BUF + 8 * count * slot
+      let view = kernView(x, 8 * count * (n === 4 ? 6 : 3))
+      putWords(view, at(0), primes, j0, count)
+      if (n === 4) {
+        for (let q = 0; q < 4; q++) putWords(view, at(1 + q), parts[q], j0, count)
+        x.combineBatch(at(0), at(1), at(2), at(3), at(4), at(5), count)
+        view = kernView(x, 8 * count * 6)
+        getWords(view, at(5), out, j0, count)
+        continue
+      }
+      // Any other number of parts: fold from the left, the running value in slot 1.
+      putWords(view, at(1), parts[0], j0, count)
+      for (let q = 1; q < n; q++) {
+        view = kernView(x, 8 * count * 3)
+        putWords(view, at(2), parts[q], j0, count)
+        x.combine2Batch(at(0), at(1), at(2), at(1), count)
+      }
+      view = kernView(x, 8 * count * 3)
+      getWords(view, at(1), out, j0, count)
+    }
+  },
+  hopPrimes(previousEventId, out) {
+    checkPreviousEventId(previousEventId)
+    const m = out.length / 2
+    if (!Number.isSafeInteger(m) || m < 1) throw new Error('the residue count is a positive integer')
+    const x = kernExports()
+    // Every index below 2^53 has 0 as the first byte of be64(j): one midstate for the whole list.
+    const mid = sha256Midstate(concatBytes(HOP_RESIDUE_PRIME_DOMAIN, previousEventId, new Uint8Array(1)))
+    for (let j0 = 0; j0 < m; j0 += KERN_CHUNK) {
+      const count = Math.min(KERN_CHUNK, m - j0)
+      let view = kernView(x, 8 * count)
+      for (let i = 0; i < 8; i++) view.setUint32(KERN_PRIME_MID + 4 * i, mid[i], true)
+      x.primesBatch(KERN_PRIME_MID, BigInt(j0), count, KERN_BUF)
+      view = kernView(x, 8 * count)
+      getWords(view, KERN_BUF, out, j0, count)
+    }
+  },
+  attempt(previousEventId, seal, nonce, p0) {
+    checkNonce(nonce)
+    const x = kernExports()
+    kernPrepareAttempts(x, previousEventId, seal, p0, 1n)
+    x.attempt(nonce)
+    return kernLastAttempt(x)
+  },
+  findNonce(previousEventId, seal, attempts, p0, start, end) {
+    if (start < 0n || end > TWO_64 || start > end) throw new Error('the nonce range must lie within 0 .. 2^64')
+    if (attempts < 1n) throw new Error('the price is at least one attempt')
+    // A price of 2^64 attempts or more does not fit the module's u64: the composed search takes it.
+    if (attempts >= TWO_64) return searchNonces(seedHasher(previousEventId, seal), p0, attempts, start, end, WASM_WORD_KERNEL)
+    const x = kernExports()
+    kernPrepareAttempts(x, previousEventId, seal, p0, attempts)
+    for (let s = start; s < end; s += KERN_GRIND_CHUNK) {
+      const count = end - s < KERN_GRIND_CHUNK ? end - s : KERN_GRIND_CHUNK
+      if (x.grind(s, count) === 1) {
+        const view = kernView(x, 0)
+        return { nonce: view.getBigUint64(x.gnoncePtr(), true), attempt: kernLastAttempt(x) }
+      }
+    }
+    return null
+  },
+}
+
 // ------------------------------------------------------------- the native BigInt backend
 
 function toBigInts(list: WordList): bigint[] {
@@ -722,7 +1073,7 @@ export function hopPrimeStart(previousEventId: Uint8Array, j: bigint | number): 
 }
 
 /** p_j (5.9): the prime search from hopPrimeStart. Never deduplicated across indices. */
-export function hopPrime(previousEventId: Uint8Array, j: bigint | number, kernel: WordKernel = JS_WORD_KERNEL): bigint {
+export function hopPrime(previousEventId: Uint8Array, j: bigint | number, kernel: WordKernel = selectWordKernel()): bigint {
   const starts = wordList(1)
   setWord(starts, 0, hopPrimeStart(previousEventId, j))
   const out = wordList(1)
@@ -731,9 +1082,14 @@ export function hopPrime(previousEventId: Uint8Array, j: bigint | number, kernel
 }
 
 /** p_0 to p_(m-1), in one batch through the kernel. */
-export function deriveHopPrimes(previousEventId: Uint8Array, m: number, kernel: WordKernel = JS_WORD_KERNEL): WordList {
+export function deriveHopPrimes(previousEventId: Uint8Array, m: number, kernel: WordKernel = selectWordKernel()): WordList {
   checkPreviousEventId(previousEventId)
   if (!Number.isSafeInteger(m) || m < 1) throw new Error('the residue count is a positive integer')
+  if (kernel.hopPrimes) {
+    const primes = wordList(m)
+    kernel.hopPrimes(previousEventId, primes)
+    return primes
+  }
   const starts = wordList(m)
   const tail = new Uint8Array(7)
   const mid = primeMidstateFor(previousEventId, 0)
@@ -860,7 +1216,7 @@ export interface HopRootResidues {
   hopN: bigint
 }
 
-export function hopRootResidues(geometry: HopGeometry, p: bigint, kernel: WordKernel = JS_WORD_KERNEL): HopRootResidues {
+export function hopRootResidues(geometry: HopGeometry, p: bigint, kernel: WordKernel = selectWordKernel()): HopRootResidues {
   const [ax, ay, az] = geometry.axes
   const x = kernel.rootResidue(p, ax.base, ax.height)
   const y = kernel.rootResidue(p, ay.base, ay.height)
@@ -871,7 +1227,7 @@ export function hopRootResidues(geometry: HopGeometry, p: bigint, kernel: WordKe
 }
 
 /** hop_n mod p (5.9, 5.11 step 5), in word arithmetic. */
-export function hopResidue(geometry: HopGeometry, p: bigint, kernel: WordKernel = JS_WORD_KERNEL): bigint {
+export function hopResidue(geometry: HopGeometry, p: bigint, kernel: WordKernel = selectWordKernel()): bigint {
   return hopRootResidues(geometry, p, kernel).hopN
 }
 
@@ -1004,8 +1360,9 @@ function attemptFrom(seed: Uint8Array, p0: bigint, kernel: WordKernel): HopAttem
 }
 
 /** One attempt (5.10) for `nonce` under a seal, its cost one aligned height-12 tree modulo p_0. */
-export function hopAttempt(previousEventId: Uint8Array, seal: Uint8Array, nonce: bigint, p0: bigint, kernel: WordKernel = JS_WORD_KERNEL): HopAttempt {
+export function hopAttempt(previousEventId: Uint8Array, seal: Uint8Array, nonce: bigint, p0: bigint, kernel: WordKernel = selectWordKernel()): HopAttempt {
   checkNonce(nonce)
+  if (kernel.attempt) return kernel.attempt(previousEventId, seal, nonce, p0)
   return attemptFrom(seedHasher(previousEventId, seal)(nonce), p0, kernel)
 }
 
@@ -1025,24 +1382,50 @@ export function findHopNonce(
   seal: Uint8Array,
   attempts: bigint,
   p0: bigint,
-  kernel: WordKernel = JS_WORD_KERNEL,
+  kernel: WordKernel = selectWordKernel(),
   search: NonceSearch = {},
 ): HopNonce | null {
   const { start = 0n, end = TWO_64, onProgress } = search
   if (start < 0n || end > TWO_64 || start > end) throw new Error('the nonce range must lie within 0 .. 2^64')
   if (attempts < 1n) throw new Error('the price is at least one attempt')
-  const seedOf = seedHasher(previousEventId, seal)
   const expected = Number(attempts)
   const tickEvery = Math.max(1, Math.floor(expected / 64))
+  const tick = onProgress && ((tried: number): void => {
+    if (tried % tickEvery === 0) onProgress(-Math.expm1(-tried / expected))
+  })
+  let found: HopNonce | null = null
+  if (kernel.findNonce) {
+    // The kernel searches whole ranges; with a progress bar, ranges of tickEvery attempts.
+    const chunk = tick ? BigInt(tickEvery) : end - start
+    let tried = 0
+    for (let s = start; s < end && found === null; s += chunk) {
+      const e = end - s < chunk ? end : s + chunk
+      found = kernel.findNonce(previousEventId, seal, attempts, p0, s, e)
+      tried += Number(e - s)
+      if (found === null) tick?.(tried)
+    }
+  } else {
+    found = searchNonces(seedHasher(previousEventId, seal), p0, attempts, start, end, kernel, tick || undefined)
+  }
+  if (found !== null) onProgress?.(1)
+  return found
+}
+
+/** The nonce search composed from the kernel's rootResidue and SHA-256 here, one attempt at a time. */
+function searchNonces(
+  seedOf: (nonce: bigint) => Uint8Array,
+  p0: bigint,
+  attempts: bigint,
+  start: bigint,
+  end: bigint,
+  kernel: WordKernel,
+  onTried?: (tried: number) => void,
+): HopNonce | null {
   let tried = 0
   for (let nonce = start; nonce < end; nonce++) {
     const attempt = attemptFrom(seedOf(nonce), p0, kernel)
-    if (meetsPrice(attempt.G, attempts)) {
-      onProgress?.(1)
-      return { nonce, attempt }
-    }
-    tried++
-    if (onProgress && tried % tickEvery === 0) onProgress(-Math.expm1(-tried / expected))
+    if (meetsPrice(attempt.G, attempts)) return { nonce, attempt }
+    onTried?.(++tried)
   }
   return null
 }
@@ -1234,7 +1617,7 @@ export function proveHopResidues<N = bigint>(
   roots: HopRoots<N>,
   options: HopResidueOptions<N> = {},
 ): HopResidueProof {
-  const kernel = options.kernel ?? JS_WORD_KERNEL
+  const kernel = options.kernel ?? selectWordKernel()
   const backend = options.backend ?? (BIGINT_BACKEND as unknown as BigBackend<N>)
   if (geometry.m > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('a residue list this long cannot be held')
   const m = Number(geometry.m)
@@ -1432,7 +1815,7 @@ const present = (v: string | null | undefined): v is string => v !== null && v !
  * the chain verifier's to check.
  */
 export function verifyHopLevel1(claim: HopClaim, options: HopVerifyOptions = {}): string[] {
-  const kernel = options.kernel ?? JS_WORD_KERNEL
+  const kernel = options.kernel ?? selectWordKernel()
   const order = options.order ?? 'spec'
   if (typeof claim.eventId !== 'string' || !HEX64.test(claim.eventId)) return ['event_id']
   if (!HEX64.test(claim.previousEventIdHex)) return ['previous_event_id']
@@ -1509,7 +1892,7 @@ export interface HopAuditOptions<N = bigint> {
  * making the hop costs.
  */
 export function auditHopLevel2<N = bigint>(claim: HopClaim, options: HopAuditOptions<N> = {}): string[] {
-  const kernel = options.kernel ?? JS_WORD_KERNEL
+  const kernel = options.kernel ?? selectWordKernel()
   const backend = options.backend ?? (BIGINT_BACKEND as unknown as BigBackend<N>)
   const maxComputeHeight = options.maxComputeHeight ?? DEFAULT_MAX_COMPUTE_HEIGHT
   if (!HEX64.test(claim.previousEventIdHex)) return ['previous_event_id']

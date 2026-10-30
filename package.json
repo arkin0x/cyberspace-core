@@ -1,6 +1,6 @@
 {
   "name": "cyberspace-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript implementation of the Cyberspace Protocol v2 core: Cantor pairing, 256-bit interleaved coordinates, movement proofs, terrain K, sectors, and location-based key derivation.",
   "license": "MIT",
   "repository": "https://github.com/arkin0x/cyberspace-cli-js",

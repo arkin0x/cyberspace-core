@@ -9,6 +9,11 @@
  * intermediate value, the 16 Level 1 checks one at a time, every verifier
  * vector with its verdict and first failing step, the version 1 list vectors,
  * the prices and the sizes. No network, no timers.
+ *
+ * The file's own provenance.spec_commit field reads 8b45430: that is the
+ * commit of hop-residue-reference.py, which the vectors were written from.
+ * The file itself was added to the spec at 06c2873, the commit it is copied
+ * from here. Both are asserted below.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -131,6 +136,9 @@ const decodeCoord = (hex: string): Xyz => coordToXyz(hexToCoord(hex))
 const ascii = (b: Uint8Array): string => new TextDecoder().decode(b)
 const hexSha = (s: string): string => bytesToHex(sha256(new TextEncoder().encode(s)))
 
+/** A stand-in event id for the vectors that carry none: no list contains it. */
+const STAND_IN_ID = hexSha('cyberspace-core residue.test.ts stand-in event id')
+
 function claimOf(v: { previous_event_id: string; c: string; C: string; tags: Tags }, extra: Partial<HopClaim> = {}): HopClaim {
   return {
     from: decodeCoord(v.c),
@@ -139,6 +147,7 @@ function claimOf(v: { previous_event_id: string; c: string; C: string; tags: Tag
     proof: v.tags.proof,
     nonce: v.tags.mn,
     openings: v.tags.mp,
+    eventId: STAND_IN_ID,
     ...extra,
   }
 }
@@ -173,6 +182,8 @@ describe('the fixture', () => {
     expect(RAW.length).toBe(422489)
     expect(bytesToHex(sha256(new Uint8Array(RAW)))).toBe(FIXTURE_SHA256)
     expect(V.provenance.chain_rules_revision).toBe('2026-10-08-residue-openings')
+    // The commit of the reference the vectors were written from, not the commit the file was copied from (06c2873).
+    expect(V.provenance.spec_commit).toBe('8b45430af330f6e93ee763716d33868706cc2879')
   })
 
   it('states the constants this module uses', () => {
@@ -377,12 +388,20 @@ describe('verifier vectors', () => {
   for (const v of VERIFIER) {
     it(`${v.name}: ${v.expected}${v.first_failure ? ` at ${v.first_failure.step}${v.first_failure.sample !== undefined ? ` ${v.first_failure.sample}` : ''}` : ''}`, () => {
       const failed = verifyHopLevel1(claimOf(v))
-      expect(failed.length === 0).toBe(v.expected === 'accept')
+      const all = verifyHopLevel1(claimOf(v), { allFailures: true })
+      const cheap = verifyHopLevel1(claimOf(v), { order: 'cost' })
+      for (const verdict of [failed, all, cheap]) expect(verdict.length === 0).toBe(v.expected === 'accept')
       if (v.first_failure === null) return
-      const first = failed[0]
       const { step, sample } = v.first_failure
-      if (step === 'form') expect(first).toMatch(/^form:(proof|mn|mp)$/)
-      else expect(first).toBe(sample === undefined ? step : `${step}:${sample}`)
+      if (step === 'form') expect(failed.every((f) => /^form:(proof|mn|mp)$/.test(f))).toBe(true)
+      else expect(failed).toEqual([sample === undefined ? step : `${step}:${sample}`])
+      // Spec order stops where the full report starts.
+      expect(all[0]).toBe(failed[0])
+      // Cost order fails at the same sample or at an earlier path.
+      if (step === 'residue' || step === 'path') {
+        const [cs, ci] = cheap[0].split(':')
+        expect(cs === step && Number(ci) === sample || (cs === 'path' && Number(ci) <= sample!)).toBe(true)
+      } else expect(cheap).toEqual(failed)
     })
   }
 
@@ -396,14 +415,28 @@ describe('verifier vectors', () => {
     expect(name('mp-missing')).toEqual(['form:mp'])
   })
 
-  it('reports every failing sample, not only the first', () => {
-    const swapped = verifyHopLevel1(claimOf(VERIFIER.find((v) => v.name === 'two-openings-swapped')!))
-    expect(swapped).toEqual(['residue:3', 'path:3', 'residue:4', 'path:4'])
+  it('stops at the first failure by default, and reports every failing sample on request', () => {
+    const claim = claimOf(VERIFIER.find((v) => v.name === 'two-openings-swapped')!)
+    expect(verifyHopLevel1(claim)).toEqual(['residue:3'])
+    expect(verifyHopLevel1(claim, { order: 'cost' })).toEqual(['path:3'])
+    expect(verifyHopLevel1(claim, { allFailures: true })).toEqual(['residue:3', 'path:3', 'residue:4', 'path:4'])
   })
 
-  it('rejects a hop with no proof tag', () => {
+  it('rejects a hop with no proof tag, a malformed previous id or a malformed event id', () => {
     expect(verifyHopLevel1(claimOf(VERIFIER[0], { proof: undefined }))).toEqual(['form:proof'])
     expect(verifyHopLevel1(claimOf(VERIFIER[0], { previousEventIdHex: 'ab' }))).toEqual(['previous_event_id'])
+    expect(verifyHopLevel1(claimOf(VERIFIER[0], { eventId: STAND_IN_ID.toUpperCase() }))).toEqual(['event_id'])
+    expect(verifyHopLevel1(claimOf(VERIFIER[0], { eventId: '' }))).toEqual(['event_id'])
+  })
+
+  it('requires the event id in the claim type', () => {
+    const v = VERIFIER[0]
+    const { eventId: _dropped, ...withoutId } = claimOf(v)
+    // @ts-expect-error eventId is required: a claim without it does not typecheck.
+    const claim: HopClaim = withoutId
+    // A JavaScript caller that drops it anyway is refused, never silently unlisted.
+    expect(verifyHopLevel1(claim)).toEqual(['event_id'])
+    expect(_dropped).toBe(STAND_IN_ID)
   })
 })
 
@@ -427,6 +460,13 @@ describe('version 1 hops and the grandfathered list', () => {
     expect(verifyHopLevel1(claimOf(v, { eventId: v.event_id }))).toEqual(['form:mn', 'form:mp'])
   })
 
+  it('a listed version 1 hop is accepted through its event id, and only through it', () => {
+    const v = V.grandfathered_v1[0]
+    const list = parseGrandfatheredList(v.grandfathered_v1_hops)
+    expect(verifyHopLevel1(claimOf(v, { eventId: v.event_id, grandfathered: list }))).toEqual([])
+    expect(verifyHopLevel1(claimOf(v, { grandfathered: list }))).toEqual(['form:mn', 'form:mp'])
+  })
+
   it('a listed hop still needs its tags well formed', () => {
     const v = V.grandfathered_v1[0]
     const list = new Set([v.event_id])
@@ -435,11 +475,21 @@ describe('version 1 hops and the grandfathered list', () => {
     expect(verifyHopLevel1(claimOf(v, { eventId: v.event_id, grandfathered: list, openings: 'ab' }))).toEqual(['form:mp'])
   })
 
-  it('parses the list format and refuses anything else', () => {
+  it('parses the list format and refuses anything else, loudly', () => {
     const id = 'ab'.repeat(32)
-    expect([...parseGrandfatheredList(`# header\n\n${id} pubkey 2026-10-30T00:00:00Z 0,13,0 11 L2-clean\n# ${'cd'.repeat(32)}\n`)]).toEqual([id])
-    expect(() => parseGrandfatheredList(id.toUpperCase())).toThrow()
-    expect(() => parseGrandfatheredList(id.slice(1))).toThrow()
+    const other = 'cd'.repeat(32)
+    expect([...parseGrandfatheredList(`# header\n\n${id} pubkey 2026-10-30T00:00:00Z 0,13,0 11 L2-clean\n# ${other}\n${other}\tnote\n`)]).toEqual([id, other])
+    expect([...parseGrandfatheredList(id)]).toEqual([id])
+    for (const bad of [
+      ` ${id}`, `\t${id}`, // leading whitespace
+      ` # comment`, `\t#comment`, // an indented #
+      ' ', '\t', '   \t ', // whitespace only
+      `${id}\r`, '\r', // a carriage return
+      id.toUpperCase(), id.slice(1), `${id}0`, `${id}x note`, `0x${id}`,
+      `${id}\n${id}`, // listed twice
+    ]) {
+      expect(() => parseGrandfatheredList(`# ok\n${bad}\n`), JSON.stringify(bad)).toThrow()
+    }
   })
 
   it('the 5.7 version 1 proof_hash still holds (5.6, 5.7), and audits as the census would', () => {
@@ -703,5 +753,49 @@ describe('properties', () => {
     const other = deriveHopPrimes(new Uint8Array(32).map((_, i) => 32 + i), 64)
     const mine = new Set(primes)
     expect(wordsOf(other).filter((p) => mine.has(p))).toEqual([])
+  })
+})
+
+// ------------------------------------------------------------- what a forgery costs the verifier
+
+describe('a junk tree under a paid price (the review of PR #9)', () => {
+  // A random seal at h20 on one axis, the nonce ground for it (8475, the
+  // first from 0 that meets A, about a second of JavaScript), and an mp of
+  // zeros. Replayable across events, so its cost to a verifier is what matters.
+  const prev = '5a'.repeat(32)
+  const E = 1n << 84n
+  const from: Xyz = { x: E, y: E, z: E, plane: 0 }
+  const to: Xyz = { x: E ^ (1n << 19n), y: E, z: E, plane: 0 }
+  const g = hopGeometry(hexToBytes(prev), from, to)
+  const seal = new Uint8Array(32).fill(7)
+  const claim: HopClaim = {
+    from, to, previousEventIdHex: prev, eventId: STAND_IN_ID,
+    proof: encodeSeal(seal), nonce: encodeHopNonce(8475n), openings: '0'.repeat(hopOpeningsLength(g.depth)),
+  }
+  /** The fastest of a few runs, so a loaded machine distorts the ratio less. */
+  const fastest = (f: () => unknown): number => {
+    let best = Infinity
+    for (let r = 0; r < 3; r++) { const t = performance.now(); f(); best = Math.min(best, performance.now() - t) }
+    return best
+  }
+
+  it('is a real forgery: the nonce meets the price at h20', () => {
+    expect(g.hMax).toBe(20)
+    expect(g.A).toBe(44856n)
+    const G = hopAttempt(hexToBytes(prev), seal, 8475n, hopPrime(hexToBytes(prev), 0)).G
+    expect(G[0]).toBe(0) // a cheap necessary condition first
+    expect(verifyHopLevel1(claim, { order: 'cost' })).not.toContain('price')
+  })
+
+  it('rejects in well under one residue in cost order, and in about one residue in spec order', { timeout: 60_000 }, () => {
+    const oneResidue = fastest(() => hopResidue(g, hopPrime(hexToBytes(prev), 3)))
+    expect(verifyHopLevel1(claim, { order: 'cost' })).toEqual(['path:0'])
+    expect(verifyHopLevel1(claim)).toEqual(['residue:0'])
+    const cost = fastest(() => verifyHopLevel1(claim, { order: 'cost' }))
+    const spec = fastest(() => verifyHopLevel1(claim))
+    const all = fastest(() => verifyHopLevel1(claim, { allFailures: true }))
+    expect(cost).toBeLessThan(oneResidue / 3)
+    expect(spec).toBeLessThan(2 * oneResidue)
+    expect(all).toBeGreaterThan(8 * oneResidue)
   })
 })

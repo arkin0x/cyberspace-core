@@ -52,15 +52,18 @@ for (const { list, out, name, commitName, doc } of LISTS) {
 
   // Sections 5.13 and 6.16: lines starting with # are comments; every other
   // non-empty line starts with a 64-character lowercase hex event id, and the
-  // rest is commentary.
+  // rest is commentary. Read strictly, as parseGrandfatheredList in
+  // src/residue.ts reads it: the id at the very start of the line, then
+  // nothing or a space or tab. Leading whitespace, an indented #, a line of
+  // only whitespace or a carriage return fail loudly, so the generated list
+  // never holds an id another port would not read.
   const entries = []
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim()
-    if (trimmed === '' || trimmed.startsWith('#')) continue
-    const [id, ...rest] = trimmed.split(/\s+/)
-    if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`${list}: not a 64-hex event id: ${trimmed}`)
-    entries.push({ id, note: rest.join(' ') })
-  }
+  text.split('\n').forEach((line, n) => {
+    if (line === '' || line.startsWith('#')) return
+    const entry = /^([0-9a-f]{64})(?:[ \t](.*))?$/.exec(line)
+    if (!entry) throw new Error(`${list} line ${n + 1} is not empty, a comment or a 64-hex event id at the start of the line: ${JSON.stringify(line)}`)
+    entries.push({ id: entry[1], note: (entry[2] ?? '').trim().split(/\s+/).join(' ') })
+  })
   if (new Set(entries.map((e) => e.id)).size !== entries.length) throw new Error(`${list} lists an id twice`)
 
   const body = entries.length === 0

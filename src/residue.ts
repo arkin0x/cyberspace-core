@@ -682,13 +682,13 @@ export const BIGINT_BACKEND: BigBackend<bigint> = {
       const nodes = levels[l]
       const next: bigint[] = new Array(nodes.length)
       for (let i = 0; i < nodes.length; i++) {
-        const v = current[i >> 1]
+        const v = current[Math.floor(i / 2)]
         next[i] = v < nodes[i] ? v : v % nodes[i]
       }
       current = next
       lowest = l
     }
-    for (let j = 0; j < primes.length; j++) setWord(out, j, current[j >> lowest] % primes[j])
+    for (let j = 0; j < primes.length; j++) setWord(out, j, current[Math.floor(j / 2 ** lowest)] % primes[j])
   },
 }
 
@@ -1120,20 +1120,30 @@ export function decodeHopOpenings(mp: string, depth: number): HopOpening[] | nul
 // ------------------------------------------------------------- the version 1 exemption list (5.13)
 
 /**
- * The ids in the text of a list in the format of grandfathered-v1-hops.txt
- * (5.13, the format of 6.16): lines starting with # are comments, and every
- * other non-empty line starts with a 64-character lowercase hex event id,
- * with commentary after it. Throws on any other line, as the generator does.
+ * One line of an exemption list (5.13, the format of 6.16): an empty line, a
+ * comment starting with # in its first column, or a 64-character lowercase hex
+ * event id at the start of the line, followed by nothing or by a space or tab
+ * and commentary. Anything else (leading whitespace, an indented #, a line of
+ * only whitespace, a carriage return) is refused, so this never accepts an id
+ * that a port reading the format strictly would not. scripts/grandfathered.mjs
+ * applies the same rule.
+ */
+const LIST_ENTRY = /^([0-9a-f]{64})(?:[ \t].*)?$/
+
+/**
+ * The ids in the text of a list in the format of grandfathered-v1-hops.txt.
+ * Throws on any line that is not empty, a comment or an entry, and on an id
+ * listed twice, as the generator does.
  */
 export function parseGrandfatheredList(text: string): Set<string> {
   const ids = new Set<string>()
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim()
-    if (trimmed === '' || trimmed.startsWith('#')) continue
-    const id = trimmed.split(/\s+/)[0]
-    if (!HEX64.test(id)) throw new Error(`not a 64-hex event id: ${trimmed}`)
-    ids.add(id)
-  }
+  text.split('\n').forEach((line, n) => {
+    if (line === '' || line.startsWith('#')) return
+    const entry = LIST_ENTRY.exec(line)
+    if (!entry) throw new Error(`line ${n + 1} is not empty, a comment or a 64-hex event id at the start of the line: ${JSON.stringify(line)}`)
+    if (ids.has(entry[1])) throw new Error(`line ${n + 1} lists ${entry[1]} twice`)
+    ids.add(entry[1])
+  })
   return ids
 }
 
@@ -1367,14 +1377,39 @@ export interface HopClaim {
   nonce: string | null | undefined
   /** The `mp` tag's value, or null (or undefined) when the event has none. */
   openings: string | null | undefined
-  /** The event's id, which decides whether a version 1 hop is exempt (5.13). */
-  eventId?: string
+  /**
+   * The event's NIP-01 id, 64 lowercase hex, which decides whether a version 1
+   * hop is exempt (5.13). Required, so that no caller can drop it by accident
+   * and turn every listed hop into a rejected one.
+   */
+  eventId: string
   /** The version 1 exemption list; GRANDFATHERED_V1_HOPS by default. */
   grandfathered?: ReadonlySet<string>
 }
 
 export interface HopVerifyOptions {
   kernel?: WordKernel
+  /**
+   * Which failure a rejected proof reports, when it fails at more than one
+   * sample or at both checks of one sample. The verdict is the same either way.
+   *
+   * - `spec` (the default): the first failure in the order of 5.11 step 5,
+   *   residue then path for each sample in ascending i, which is the
+   *   `first_failure` of the spec's vectors. Every path is climbed first,
+   *   because a climb costs microseconds and a residue milliseconds, and
+   *   residues are computed only up to the first sample whose path fails, so
+   *   a junk tree costs at most one residue.
+   * - `cost`: a failing path rejects at once, before any residue is computed,
+   *   so a junk tree costs one attempt and 16 climbs. The step reported can
+   *   then be a path where `spec` would report that sample's residue.
+   */
+  order?: 'spec' | 'cost'
+  /**
+   * Check every sample and report every failure, residue and path, in spec
+   * order, instead of stopping at the first. For diagnostics: it always costs
+   * 16 residues.
+   */
+  allFailures?: boolean
 }
 
 const present = (v: string | null | undefined): v is string => v !== null && v !== undefined
@@ -1382,11 +1417,13 @@ const present = (v: string | null | undefined): v is string => v !== null && v !
 /**
  * Level 1 verification of a hop's proof (5.11, 8.7.1 steps 7 to 11): the
  * tags' form and width, one attempt and its price, the 16 indices from G, and
- * for each sample its residue recomputed in word arithmetic and its path
- * climbed to the seal. Never builds a root, region_n or hop_n. Returns the
- * names of what failed, in the order the steps run, as `step` or
- * `step:detail`: `form:proof`, `form:mn`, `form:mp`, `geometry`, `price`,
- * `residue:i` and `path:i` for sample i. Empty means the proof is valid.
+ * for each sample its path climbed to the seal and its residue recomputed in
+ * word arithmetic. Never builds a root, region_n or hop_n. Returns what
+ * failed, as `step` or `step:detail`: `event_id`, `previous_event_id`,
+ * `form:proof`, `form:mn`, `form:mp` (every malformed tag is named),
+ * `geometry`, `price`, `residue:i` and `path:i` for sample i. Past the form,
+ * it stops at the first failure (see HopVerifyOptions for which one and for
+ * reporting all). Empty means the proof is valid.
  *
  * A hop whose id is on the list is a version 1 hop exempt under 5.13: its
  * `proof` is accepted without steps 8 to 11, and only the form of the tags it
@@ -1396,6 +1433,8 @@ const present = (v: string | null | undefined): v is string => v !== null && v !
  */
 export function verifyHopLevel1(claim: HopClaim, options: HopVerifyOptions = {}): string[] {
   const kernel = options.kernel ?? JS_WORD_KERNEL
+  const order = options.order ?? 'spec'
+  if (typeof claim.eventId !== 'string' || !HEX64.test(claim.eventId)) return ['event_id']
   if (!HEX64.test(claim.previousEventIdHex)) return ['previous_event_id']
   const prev = hexToBytes(claim.previousEventIdHex)
   const geometry = hopGeometry(prev, claim.from, claim.to)
@@ -1424,17 +1463,33 @@ export function verifyHopLevel1(claim: HopClaim, options: HopVerifyOptions = {})
   const attempt = hopAttempt(prev, seal, nonce, hopPrime(prev, 0, kernel), kernel)
   if (!meetsPrice(attempt.G, geometry.A)) return ['price']
 
-  // Steps 9 and 10: the indices, then each sample's residue and path.
+  // Steps 9 and 10: the indices; every path, which is cheap; then the
+  // residues, which are not, only as far as the order needs them.
   const indices = hopSampleIndices(attempt.G, geometry.m)
   const block = BigInt(RESIDUE_BLOCK)
-  indices.forEach((idx, i) => {
-    const opening = openings[i]
-    const want = hopResidue(geometry, hopPrime(prev, idx, kernel), kernel)
-    if (opening.residues[Number(idx % block)] !== want) failed.push(`residue:${i}`)
+  const pathHolds = indices.map((idx, i) => {
     const b = idx / block
-    if (!verifyHopPath(hopLeafHash(prev, b, opening.residues), b, opening.siblings, seal)) failed.push(`path:${i}`)
+    return verifyHopPath(hopLeafHash(prev, b, openings[i].residues), b, openings[i].siblings, seal)
   })
-  return failed
+  const residueHolds = (i: number): boolean =>
+    openings[i].residues[Number(indices[i] % block)] === hopResidue(geometry, hopPrime(prev, indices[i], kernel), kernel)
+
+  if (options.allFailures) {
+    for (let i = 0; i < HOP_SAMPLES; i++) {
+      if (!residueHolds(i)) failed.push(`residue:${i}`)
+      if (!pathHolds[i]) failed.push(`path:${i}`)
+    }
+    return failed
+  }
+  const firstBadPath = pathHolds.indexOf(false)
+  if (order === 'cost' && firstBadPath >= 0) return [`path:${firstBadPath}`]
+  // In spec order, no sample past the first bad path can be the first failure.
+  const last = firstBadPath >= 0 ? firstBadPath : HOP_SAMPLES - 1
+  for (let i = 0; i <= last; i++) {
+    if (!residueHolds(i)) return [`residue:${i}`]
+    if (!pathHolds[i]) return [`path:${i}`]
+  }
+  return []
 }
 
 export interface HopAuditOptions<N = bigint> {
@@ -1464,7 +1519,8 @@ export function auditHopLevel2<N = bigint>(claim: HopClaim, options: HopAuditOpt
     const v1 = computeHopProof(from.x, from.y, from.z, to.x, to.y, to.z, to.plane, claim.previousEventIdHex, maxComputeHeight)
     return v1.proofHash === claim.proof ? [] : ['proof']
   }
-  const failed = verifyHopLevel1({ ...claim, eventId: undefined }, { kernel })
+  // The list waives only Level 1's re-checking; an audit ignores it.
+  const failed = verifyHopLevel1({ ...claim, grandfathered: new Set() }, { kernel })
   if (failed.length) return failed
   const prev = hexToBytes(claim.previousEventIdHex)
   const geometry = hopGeometry(prev, claim.from, claim.to)

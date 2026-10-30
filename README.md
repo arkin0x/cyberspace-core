@@ -45,6 +45,49 @@ disabled). Both give identical values. Pass `kernel: JS_WORD_KERNEL` or
 synchronous compile is refused, `await loadWasmWordKernel()` once at start. The
 module is embedded in the package; nothing is fetched.
 
+### Injecting a big-number backend
+
+Every big-number step of a hop goes through a `BigBackend`: the Cantor trees,
+the exact pairings for `region_n`, the product tree of the primes, the region
+pairings modulo Q and the remainder trees. `BIGINT_BACKEND` (native BigInt) is
+the default and the only backend core ships. To use another, pass it as
+`backend` to `computeHopProofV2`, `proveHopResidues`, `computeHopResidues` or
+`auditHopLevel2`:
+
+```ts
+import { computeHopProofV2, type BigBackend } from 'cyberspace-core'
+
+const gmp: BigBackend<number> = await loadMyGmpAdapter() // your code, not core's
+const proof = computeHopProofV2(x1, y1, z1, x2, y2, z2, plane, previousEventIdHex, { backend: gmp })
+```
+
+A backend MUST return exactly what `BIGINT_BACKEND` returns, and then the tags
+are byte for byte the same. Its values are its own type, and core passes them
+back only to the same backend. A backend whose values live outside the
+JavaScript heap (GMP's `mpz_t` in WebAssembly memory) also implements `release`
+and `releaseTree`. Core calls them once for every value and tree it made
+through the backend, even when it throws, and never for roots the caller
+passed in. `test/support/gmpBackend.ts` is a working adapter over `gmp-wasm`.
+The residue suite runs every vector through it with both word kernels. Copy it
+into your project; do not import it. The exported kernels and
+`BIGINT_BACKEND` are frozen.
+
+GMP is not bundled, for three reasons:
+
+- **License.** `gmp-wasm` is LGPL-3.0 and core is MIT. Bundling it would put
+  the LGPL's obligations on every consumer, including the ones that never use
+  it.
+- **Size.** It is 242 KB (157 KB gzipped), against core's 14 KB word kernel. It
+  saves about a fifth of a hop at browser heights: 18% on a residue hop at h20
+  in the research, and more where BigInt is slow (Android). So a consumer loads
+  it lazily, and only for tall hops. ONOSENDAI does this from h17.
+- **Memory ceiling.** GMP runs in a single 32-bit WebAssembly memory (2 to 4 GB).
+  In the research it aborted on a version 1 hop at h22 and on the product tree
+  at h24. A consumer that loads it chooses its own fallback.
+
+`gmp-wasm` is a devDependency, pinned exactly, and used only by that test. The
+published package does not contain it and does not install it.
+
 ## Cantor convention
 
 `pi(a, b) = (a + b)(a + b + 1) / 2 + b`

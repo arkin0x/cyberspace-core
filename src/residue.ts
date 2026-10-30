@@ -22,10 +22,13 @@
  * WebAssembly, committed as kernWasm.ts). Every function that takes a kernel
  * defaults to selectWordKernel(): WASM when WebAssembly is there and the
  * module can be instantiated, JavaScript otherwise. A BigBackend does the big
- * numbers (the Cantor trees, the product tree of the primes and the remainder
- * tree); BIGINT_BACKEND is
- * native BigInt, and a GMP adapter can take its place. Every implementation
- * of either MUST give the same values, which the golden vectors check.
+ * numbers: the Cantor trees, the exact pairings for region_n, the product
+ * tree of the primes, the pairings modulo Q and the remainder trees.
+ * BIGINT_BACKEND is native BigInt and the default; a consumer passes its own
+ * as `backend` to computeHopProofV2, proveHopResidues, computeHopResidues or
+ * auditHopLevel2 (a GMP adapter, say, which core never imports: see the
+ * README). Every implementation of either MUST give the same values, which
+ * the golden vectors check. The three exported implementations are frozen.
  *
  * Checked against the spec's hop-residue-vectors.json (written from
  * hop-residue-reference.py), copied unchanged into test/fixtures.
@@ -223,9 +226,16 @@ export interface ProductTree<N> {
 }
 
 /**
- * The big-number arithmetic of a hop: the Cantor trees, the exact pairings
- * for region_n, and the product and remainder trees of the prover. The values
- * are the backend's own type N; native BigInt is N = bigint.
+ * The big-number arithmetic of a hop, every step of the prover that works on
+ * numbers wider than a word: the Cantor trees, the exact pairings for
+ * region_n, the product tree of the primes, the region pairings modulo Q (the
+ * multi-axis path of the prover) and the remainder trees. The values are the
+ * backend's own type N, which core only passes back to the same backend;
+ * native BigInt is N = bigint.
+ *
+ * Any implementation MUST return exactly the values BIGINT_BACKEND returns
+ * (the residues, and so the tags, are then bit for bit the same); it chooses
+ * only how fast and in what memory. Methods never modify their arguments.
  */
 export interface BigBackend<N = bigint> {
   readonly name: string
@@ -241,6 +251,17 @@ export interface BigBackend<N = bigint> {
   pairModQ(tree: ProductTree<N>, a: N, b: N): N
   /** x mod p_j for every prime, by one descent of the tree, into entry j of `out`. */
   remainders(tree: ProductTree<N>, x: N, out: WordList): void
+  /**
+   * Optional, for a backend whose values live outside the JavaScript heap (a
+   * GMP adapter's mpz_t in WebAssembly memory, which no garbage collector
+   * sees): frees one value. Core calls it exactly once for every value it
+   * made through the backend, as soon as it no longer needs it, and never for
+   * a value it was given (the roots handed to proveHopResidues and
+   * computeHopResidues stay the caller's). BigInt needs neither hook.
+   */
+  release?(value: N): void
+  /** Optional, as `release`: frees a product tree core made through `productTree`. */
+  releaseTree?(tree: ProductTree<N>): void
 }
 
 // ------------------------------------------------------------- residues of a root, by definition (5.9)
@@ -610,7 +631,7 @@ function rootResidueAt(p: bigint, base: bigint, height: number, k: number): bigi
 }
 
 /** The pure JavaScript word kernel: Montgomery arithmetic in 25-bit limbs, the difference engine for roots. */
-export const JS_WORD_KERNEL: WordKernel = {
+export const JS_WORD_KERNEL: WordKernel = Object.freeze<WordKernel>({
   name: 'js',
   searchPrimes(starts, out) {
     if (out.length !== starts.length) throw new Error('searchPrimes writes one prime per start')
@@ -654,7 +675,7 @@ export const JS_WORD_KERNEL: WordKernel = {
     }
     lastContext = null
   },
-}
+})
 
 // ------------------------------------------------------------- the WASM word kernel
 //
@@ -885,7 +906,7 @@ function kernLastAttempt(x: KernExports): HopAttempt {
  * ahead of time by loadWasmWordKernel(). Gives exactly JS_WORD_KERNEL's
  * values, several times faster.
  */
-export const WASM_WORD_KERNEL: WordKernel = {
+export const WASM_WORD_KERNEL: WordKernel = Object.freeze<WordKernel>({
   name: 'wasm',
   searchPrimes(starts, out) {
     if (out.length !== starts.length) throw new Error('searchPrimes writes one prime per start')
@@ -985,7 +1006,7 @@ export const WASM_WORD_KERNEL: WordKernel = {
     }
     return null
   },
-}
+})
 
 // ------------------------------------------------------------- the native BigInt backend
 
@@ -996,7 +1017,7 @@ function toBigInts(list: WordList): bigint[] {
 }
 
 /** Native BigInt: the Cantor trees of movement.ts, and the product and remainder trees in plain BigInt. */
-export const BIGINT_BACKEND: BigBackend<bigint> = {
+export const BIGINT_BACKEND: BigBackend<bigint> = Object.freeze<BigBackend<bigint>>({
   name: 'bigint',
   fromBigInt: (v) => v,
   toBigInt: (v) => v,
@@ -1041,7 +1062,7 @@ export const BIGINT_BACKEND: BigBackend<bigint> = {
     }
     for (let j = 0; j < primes.length; j++) setWord(out, j, current[Math.floor(j / 2 ** lowest)] % primes[j])
   },
-}
+})
 
 // ------------------------------------------------------------- the hop primes (5.9)
 
@@ -1576,7 +1597,9 @@ export interface HopResidueProof {
  * remainder tree for it and one for the temporal root (a K = 0 root is t_base,
  * a word or two, reduced directly); then the temporal residues paired in,
  * modulo each prime. A still axis is a trivial tree whose root is its base,
- * so a single-axis hop takes the same path.
+ * so a single-axis hop takes the same path. Every big-number step goes
+ * through `backend`; the roots stay the caller's, and the product tree and
+ * the values modulo Q are released here (BigBackend.release).
  */
 export function computeHopResidues<N>(
   primes: WordList,
@@ -1587,17 +1610,31 @@ export function computeHopResidues<N>(
   onProgress?: ProgressFn,
 ): WordList {
   const m = primes.length / 2
-  const tree = backend.productTree(primes)
-  onProgress?.(0.25)
-  const region = backend.pairModQ(tree, backend.pairModQ(tree, roots.x, roots.y), roots.z)
   const regionResidues = wordList(m)
-  backend.remainders(tree, region, regionResidues)
-  onProgress?.(0.6)
   const temporalResidues = wordList(m)
-  if (geometry.temporal.height > 0) backend.remainders(tree, roots.t, temporalResidues)
-  else {
-    const t = backend.toBigInt(roots.t)
-    for (let j = 0; j < m; j++) setWord(temporalResidues, j, t % wordAt(primes, j))
+  const tree = backend.productTree(primes)
+  try {
+    onProgress?.(0.25)
+    const xy = backend.pairModQ(tree, roots.x, roots.y)
+    let region: N
+    try {
+      region = backend.pairModQ(tree, xy, roots.z)
+    } finally {
+      backend.release?.(xy)
+    }
+    try {
+      backend.remainders(tree, region, regionResidues)
+    } finally {
+      backend.release?.(region)
+    }
+    onProgress?.(0.6)
+    if (geometry.temporal.height > 0) backend.remainders(tree, roots.t, temporalResidues)
+    else {
+      const t = backend.toBigInt(roots.t)
+      for (let j = 0; j < m; j++) setWord(temporalResidues, j, t % wordAt(primes, j))
+    }
+  } finally {
+    backend.releaseTree?.(tree)
   }
   onProgress?.(0.85)
   const residues = wordList(m)
@@ -1718,30 +1755,37 @@ export function computeHopProofV2<N = bigint>(
   }
 
   const [ax, ay, az] = geometry.axes
-  const rx = backend.subtreeCantor(ax.base, ax.height, maxComputeHeight, stage(0))
-  const ry = backend.subtreeCantor(ay.base, ay.height, maxComputeHeight, stage(1))
-  const rz = backend.subtreeCantor(az.base, az.height, maxComputeHeight, stage(2))
-  const rt = backend.subtreeCantor(geometry.temporal.base, geometry.K, TEMPORAL_MAX_COMPUTE_HEIGHT, stage(3))
-  const rxy = backend.pair(rx, ry)
-  stage(4)?.(1)
-  const regionN = backend.toBigInt(backend.pair(rxy, rz))
-  stage(5)?.(1)
-  const proof = proveHopResidues(prev, geometry, { x: rx, y: ry, z: rz, t: rt }, { ...options, backend, onProgress: stage(6) })
-  onProgress?.(1)
-  return {
-    cantorX: backend.toBigInt(rx),
-    cantorY: backend.toBigInt(ry),
-    cantorZ: backend.toBigInt(rz),
-    regionN,
-    terrainK: geometry.K,
-    temporalSeed: geometry.temporalSeed,
-    cantorT: backend.toBigInt(rt),
-    geometry,
-    seal: proof.seal,
-    nonce: proof.nonce,
-    G: proof.attempt.G,
-    indices: proof.indices,
-    tags: proof.tags,
+  // Every value made through the backend, released on the way out, thrown or not.
+  const made: N[] = []
+  const keep = (v: N): N => { made.push(v); return v }
+  try {
+    const rx = keep(backend.subtreeCantor(ax.base, ax.height, maxComputeHeight, stage(0)))
+    const ry = keep(backend.subtreeCantor(ay.base, ay.height, maxComputeHeight, stage(1)))
+    const rz = keep(backend.subtreeCantor(az.base, az.height, maxComputeHeight, stage(2)))
+    const rt = keep(backend.subtreeCantor(geometry.temporal.base, geometry.K, TEMPORAL_MAX_COMPUTE_HEIGHT, stage(3)))
+    const rxy = keep(backend.pair(rx, ry))
+    stage(4)?.(1)
+    const regionN = backend.toBigInt(keep(backend.pair(rxy, rz)))
+    stage(5)?.(1)
+    const proof = proveHopResidues(prev, geometry, { x: rx, y: ry, z: rz, t: rt }, { ...options, backend, onProgress: stage(6) })
+    onProgress?.(1)
+    return {
+      cantorX: backend.toBigInt(rx),
+      cantorY: backend.toBigInt(ry),
+      cantorZ: backend.toBigInt(rz),
+      regionN,
+      terrainK: geometry.K,
+      temporalSeed: geometry.temporalSeed,
+      cantorT: backend.toBigInt(rt),
+      geometry,
+      seal: proof.seal,
+      nonce: proof.nonce,
+      G: proof.attempt.G,
+      indices: proof.indices,
+      tags: proof.tags,
+    }
+  } finally {
+    if (backend.release) for (const v of made) backend.release(v)
   }
 }
 
@@ -1908,13 +1952,19 @@ export function auditHopLevel2<N = bigint>(claim: HopClaim, options: HopAuditOpt
   const prev = hexToBytes(claim.previousEventIdHex)
   const geometry = hopGeometry(prev, claim.from, claim.to)
   const [ax, ay, az] = geometry.axes
-  const roots: HopRoots<N> = {
-    x: backend.subtreeCantor(ax.base, ax.height, maxComputeHeight),
-    y: backend.subtreeCantor(ay.base, ay.height, maxComputeHeight),
-    z: backend.subtreeCantor(az.base, az.height, maxComputeHeight),
-    t: backend.subtreeCantor(geometry.temporal.base, geometry.K, TEMPORAL_MAX_COMPUTE_HEIGHT),
+  const made: N[] = []
+  const keep = (v: N): N => { made.push(v); return v }
+  try {
+    const roots: HopRoots<N> = {
+      x: keep(backend.subtreeCantor(ax.base, ax.height, maxComputeHeight)),
+      y: keep(backend.subtreeCantor(ay.base, ay.height, maxComputeHeight)),
+      z: keep(backend.subtreeCantor(az.base, az.height, maxComputeHeight)),
+      t: keep(backend.subtreeCantor(geometry.temporal.base, geometry.K, TEMPORAL_MAX_COMPUTE_HEIGHT)),
+    }
+    const primes = deriveHopPrimes(prev, Number(geometry.m), kernel)
+    const residues = computeHopResidues(primes, geometry, roots, kernel, backend)
+    return encodeSeal(hopSealTree(prev, residues).seal) === claim.proof ? [] : ['seal']
+  } finally {
+    if (backend.release) for (const v of made) backend.release(v)
   }
-  const primes = deriveHopPrimes(prev, Number(geometry.m), kernel)
-  const residues = computeHopResidues(primes, geometry, roots, kernel, backend)
-  return encodeSeal(hopSealTree(prev, residues).seal) === claim.proof ? [] : ['seal']
 }

@@ -166,6 +166,7 @@ export function searchBatch(inPtr: usize, outPtr: usize, count: u32): void {
 const STK = new StaticArray<u64>(72)
 const LVL = new StaticArray<i32>(72)
 const DTAB: usize = 1024   // engine table: (2^k + 1) u64, k <= 12 -> 32 KB
+const ENGINE_MAX_K: i32 = 12
 
 /** Montgomery root over [b, b + 2^h) with b given in Montgomery form. */
 function treeM(bm: u64, h: i32): u64 {
@@ -181,7 +182,15 @@ function treeM(bm: u64, h: i32): u64 {
   return STK[0]
 }
 
+/**
+ * The root by the method of differences at level k. The table holds
+ * 2^ENGINE_MAX_K + 1 entries and a larger k would write past it into the
+ * static data at 65536, so k is clamped to [0, ENGINE_MAX_K] and then to h;
+ * every level gives the same residue, so the clamp changes no value.
+ */
 function engineM(bm: u64, h: i32, k: i32): u64 {
+  if (k > ENGINE_MAX_K) k = ENGINE_MAX_K
+  if (k < 0) k = 0
   if (k > h) k = h
   const d: i32 = 1 << k
   const nodes: u64 = <u64>1 << <u64>(h - k)

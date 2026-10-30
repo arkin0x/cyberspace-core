@@ -10,11 +10,17 @@
  * vector with its verdict and first failing step, the version 1 list vectors,
  * the prices and the sizes. No network, no timers.
  *
- * Every test runs twice, once through each word kernel (JS_WORD_KERNEL and
- * WASM_WORD_KERNEL), each pass guarded so that a call reaching the other
- * kernel fails. After them: the committed WASM module against its recorded
- * hashes and its source, kernel selection, and a differential test of the two
- * kernels on random inputs and on the edges of the Montgomery arithmetic.
+ * Every test runs four times: through each word kernel (JS_WORD_KERNEL and
+ * WASM_WORD_KERNEL) with each big-number backend (BIGINT_BACKEND and the
+ * test-only GMP adapter of support/gmpBackend.ts, gmp-wasm being a
+ * devDependency core never imports). Each pass is guarded: a call reaching
+ * another pass's kernel or backend fails, a call that forgot its kernel and
+ * entered the WASM module during a JavaScript pass fails, every test that
+ * takes a backend checks that it was used, and no GMP value outlives the
+ * call that made it. After them: the committed WASM module against its
+ * recorded hashes and its source, kernel selection, the frozen exports, the
+ * GMP adapter on its own, and a differential test of the two kernels on
+ * random inputs and on the edges of the Montgomery arithmetic.
  *
  * The file's own provenance.spec_commit field reads 8b45430: that is the
  * commit of hop-residue-reference.py, which the vectors were written from.
@@ -88,12 +94,15 @@ import {
   wordList,
   wordListSha256,
   wordsOf,
+  type BigBackend,
   type HopClaim,
   type HopGeometry,
   type HopResidueProof,
+  type HopRoots,
   type HopVerifyOptions,
   type WordKernel,
 } from '../src/residue.js'
+import { loadGmpBackend } from './support/gmpBackend.js'
 
 const FIXTURE_SHA256 = '29b2222d3768b173b82887d9fb992cda23044ef84cfcfca48dd049766c7c4d33'
 const SPEC_COMMIT = '06c287332651f99b75e609b7b098e165993750fd'
@@ -189,27 +198,94 @@ function rng(seed: bigint): () => bigint {
   }
 }
 
-// ------------------------------------------------------------- both kernels
+// ------------------------------------------------------------- both kernels, both backends
 
-const KERNELS: readonly WordKernel[] = [JS_WORD_KERNEL, WASM_WORD_KERNEL]
+/** The pass under way: its kernel's name and its backend's. null where a test uses both on purpose. */
+let ACTIVE: string | null = null
+let ACTIVE_BACKEND: string | null = null
+/** Calls into each guarded backend copy, by name, so a test can tell that its backend was the one used. */
+const BACKEND_CALLS: Record<string, number> = {}
 
 /**
- * The kernel the current pass may use. Every method of both kernels is
- * wrapped so that a call into the other one fails the test: a call that
- * forgot its kernel would otherwise take the default (WASM in Node) and pass
- * unnoticed in the JavaScript pass. null where a test uses both on purpose.
+ * A frozen copy of `inner` whose every method first checks the pass. The
+ * exported kernels and backend are frozen, so a consumer cannot patch them
+ * and neither can this file: the passes run on these copies instead.
  */
-let ACTIVE: string | null = null
-for (const kernel of KERNELS) {
-  const methods = kernel as unknown as Record<string, unknown>
-  for (const key of Object.keys(methods)) {
-    const f = methods[key]
-    if (typeof f !== 'function') continue
-    methods[key] = (...args: unknown[]): unknown => {
-      if (ACTIVE !== null && ACTIVE !== kernel.name) throw new Error(`the ${kernel.name} kernel was called in the ${ACTIVE} pass`)
-      return (f as (...a: unknown[]) => unknown)(...args)
+function guardedCopy<T extends { readonly name: string }>(inner: T, active: () => string | null, onCall?: () => void): T {
+  const copy: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(inner)) {
+    if (typeof value !== 'function') { copy[key] = value; continue }
+    copy[key] = (...args: unknown[]): unknown => {
+      const pass = active()
+      if (pass !== null && pass !== inner.name) throw new Error(`${inner.name} was called in the ${pass} pass`)
+      onCall?.()
+      return (value as (...a: unknown[]) => unknown).apply(inner, args)
     }
   }
+  return Object.freeze(copy) as unknown as T
+}
+
+/*
+ * A call that forgot its kernel takes the default, which in Node is the real
+ * WASM_WORD_KERNEL that no copy sees, and would pass unnoticed in the
+ * JavaScript pass. So the module is guarded where it is made: every instance
+ * of the kernel module (recognised by its exports; GMP's module is left
+ * alone) gets its functions wrapped so that entering it during a JavaScript
+ * pass fails. Core instantiates the kernel lazily, after this file has run,
+ * so its instance is made here.
+ */
+const RealInstance = WebAssembly.Instance
+function GuardedInstance(module: WebAssembly.Module, imports?: WebAssembly.Imports): WebAssembly.Instance {
+  const real = new RealInstance(module, imports)
+  if (!WebAssembly.Module.exports(module).some((e) => e.name === 'grindSetup')) return real
+  const exports: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(real.exports)) {
+    if (typeof value !== 'function') { exports[key] = value; continue }
+    exports[key] = (...args: unknown[]): unknown => {
+      if (ACTIVE === 'js') throw new Error(`the WASM module was entered in the js pass (${key})`)
+      return (value as (...a: unknown[]) => unknown)(...args)
+    }
+  }
+  return { exports } as WebAssembly.Instance
+}
+Object.defineProperty(WebAssembly, 'Instance', { value: GuardedInstance, writable: true, configurable: true })
+
+const GMP = await loadGmpBackend()
+
+type AnyBackend = BigBackend<unknown>
+const KERNELS: readonly WordKernel[] = [JS_WORD_KERNEL, WASM_WORD_KERNEL].map((k) => guardedCopy(k, () => ACTIVE))
+const BACKENDS: readonly AnyBackend[] = [BIGINT_BACKEND as AnyBackend, GMP as AnyBackend].map((b) =>
+  guardedCopy(b, () => ACTIVE_BACKEND, () => { BACKEND_CALLS[b.name] = (BACKEND_CALLS[b.name] ?? 0) + 1 }))
+/** Every kernel with every backend: [kernel name, backend name, kernel, backend]. */
+const PASSES = BACKENDS.flatMap((B) => KERNELS.map((K) => [K.name, B.name, K, B] as const))
+
+/**
+ * f(), asserting that it went through B (a call that forgot its backend takes
+ * the real BIGINT_BACKEND, not B's guarded copy) and that it gave back every
+ * GMP value it made.
+ */
+function throughBackend<T>(B: AnyBackend, f: () => T): T {
+  const calls = BACKEND_CALLS[B.name] ?? 0
+  const live = GMP.live()
+  const out = f()
+  expect(BACKEND_CALLS[B.name] ?? 0, `the ${B.name} backend was not used`).toBeGreaterThan(calls)
+  expect(GMP.live(), 'GMP values made and never released').toBe(live)
+  return out
+}
+
+/** The exact roots of a hop built by B; the caller releases them with releaseRoots. */
+function backendRoots(g: HopGeometry, B: AnyBackend): HopRoots<unknown> {
+  const [ax, ay, az] = g.axes
+  return {
+    x: B.subtreeCantor(ax.base, ax.height, 30),
+    y: B.subtreeCantor(ay.base, ay.height, 30),
+    z: B.subtreeCantor(az.base, az.height, 30),
+    t: B.subtreeCantor(g.temporal.base, g.temporal.height, 30),
+  }
+}
+
+function releaseRoots(B: AnyBackend, roots: HopRoots<unknown>): void {
+  for (const v of [roots.x, roots.y, roots.z, roots.t]) B.release?.(v)
 }
 
 /** A describe whose tests use both kernels. */
@@ -246,10 +322,11 @@ function counting(inner: WordKernel): { kernel: WordKernel; roots: CountedRoot[]
 
 // ------------------------------------------------------------- every test, through each kernel
 
-describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_name, K) => {
+describe.each(PASSES)('the %s word kernel with the %s backend', (_kernel, _backend, K, B) => {
   ACTIVE = K.name
-  beforeAll(() => { ACTIVE = K.name })
-  afterAll(() => { ACTIVE = null })
+  ACTIVE_BACKEND = B.name
+  beforeAll(() => { ACTIVE = K.name; ACTIVE_BACKEND = B.name })
+  afterAll(() => { ACTIVE = null; ACTIVE_BACKEND = null })
 
   // ------------------------------------------------------------- the fixture itself
 
@@ -352,15 +429,22 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
         expect(g.A.toString()).toBe(v.A)
 
         // The roots modulo p_0, from the geometry and from the exact roots.
-        const roots = exactRoots(g)
+        const exact = exactRoots(g)
         const p0 = hopPrime(prev, 0, K)
         const r0 = hopRootResidues(g, p0, K)
         const want0 = { x: r0.x, y: r0.y, z: r0.z, t: r0.t, hop_n: r0.hopN }
         expect(Object.fromEntries(Object.entries(want0).map(([k, x]) => [k, x.toString()]))).toEqual(v.roots_mod_p0)
-        expect([roots.x % p0, roots.y % p0, roots.z % p0, roots.t % p0]).toEqual([r0.x, r0.y, r0.z, r0.t])
+        expect([exact.x % p0, exact.y % p0, exact.z % p0, exact.t % p0]).toEqual([r0.x, r0.y, r0.z, r0.t])
 
-        // The whole prover.
-        const proof: HopResidueProof = proveHopResidues(prev, g, roots, { kernel: K })
+        // The whole prover, on roots the pass's backend built.
+        const roots = backendRoots(g, B)
+        let proof: HopResidueProof
+        try {
+          expect([roots.x, roots.y, roots.z, roots.t].map((r) => B.toBigInt(r))).toEqual([exact.x, exact.y, exact.z, exact.t])
+          proof = throughBackend(B, () => proveHopResidues(prev, g, roots, { kernel: K, backend: B }))
+        } finally {
+          releaseRoots(B, roots)
+        }
         expect(wordsOf(proof.primes).slice(0, 8).map(String)).toEqual(v.primes_first_8)
         expect(wordAt(proof.primes, v.m - 1).toString()).toBe(v.prime_last)
         expect(bytesToHex(wordListSha256(proof.primes))).toBe(v.primes_sha256)
@@ -391,7 +475,7 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
     it('computeHopProofV2 gives the same tags, roots and region_n, end to end', { timeout: 120_000 }, () => {
       for (const v of PROVER) {
         const from = decodeCoord(v.c), to = decodeCoord(v.C)
-        const p = computeHopProofV2(from.x, from.y, from.z, to.x, to.y, to.z, to.plane, v.previous_event_id, { kernel: K })
+        const p = throughBackend(B, () => computeHopProofV2(from.x, from.y, from.z, to.x, to.y, to.z, to.plane, v.previous_event_id, { kernel: K, backend: B }))
         expect(p.tags, v.name).toEqual(v.tags)
         expect(bytesToHex(p.seal)).toBe(v.seal)
         expect(p.nonce).toBe(BigInt(v.nonce))
@@ -408,7 +492,7 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
     it('reports progress that rises to 1', () => {
       const v = prover('golden-5.7')
       const seen: number[] = []
-      computeHopProofV2(0n, 0n, 0n, 4104n, 0n, 0n, 0, v.previous_event_id, { kernel: K, onProgress: (f) => seen.push(f) })
+      throughBackend(B, () => computeHopProofV2(0n, 0n, 0n, 4104n, 0n, 0n, 0, v.previous_event_id, { kernel: K, backend: B, onProgress: (f) => seen.push(f) }))
       expect(seen.length).toBeGreaterThan(5)
       for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1])
       expect(seen[seen.length - 1]).toBe(1)
@@ -425,6 +509,39 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
   })
 
   // ------------------------------------------------------------- the 16 checks, one at a time
+
+  describe('the seams themselves', () => {
+    it('the guards catch a call that forgot its kernel or its backend', () => {
+      const v = prover('golden-5.7')
+      const prev = hexToBytes(v.previous_event_id)
+      // No kernel: the default, WASM in Node, which the JavaScript pass refuses.
+      if (K.name === 'js') expect(() => hopPrime(prev, 0)).toThrow(/entered in the js pass/)
+      else expect(hopPrime(prev, 0)).toBe(2501841973170584791n)
+      // No backend: the real BIGINT_BACKEND, so this pass's copy sees no call.
+      const calls = BACKEND_CALLS[B.name] ?? 0
+      expect(computeHopProofV2(0n, 0n, 0n, 4104n, 0n, 0n, 0, v.previous_event_id, { kernel: K }).tags).toEqual(v.tags)
+      expect(BACKEND_CALLS[B.name] ?? 0).toBe(calls)
+    })
+
+    it('every value made through the backend is released, also when the prover throws', () => {
+      // The vector whose nonce is largest: a search that stops just short of it finds none.
+      const v = PROVER.reduce((a, b) => (b.nonce > a.nonce ? b : a))
+      expect(v.nonce).toBeGreaterThan(0)
+      const from = decodeCoord(v.c), to = decodeCoord(v.C)
+      const live = GMP.live()
+      const run = (): unknown => computeHopProofV2(from.x, from.y, from.z, to.x, to.y, to.z, to.plane, v.previous_event_id, {
+        kernel: K, backend: B, nonceSearch: { start: 0n, end: BigInt(v.nonce) },
+      })
+      expect(run).toThrow(/no nonce in the range/)
+      expect(GMP.live()).toBe(live)
+      // A height the caller refuses: x (height 3) is built, then y (height 13) is refused.
+      const calls = BACKEND_CALLS[B.name] ?? 0
+      expect(() => computeHopProofV2(0n, 0n, 0n, 5n, 4104n, 0n, 0, v.previous_event_id, { kernel: K, backend: B, maxComputeHeight: 12 })).toThrow(/height 13 exceeds maxComputeHeight 12/)
+      // Two trees asked for, and x given back where the backend takes values back.
+      expect(BACKEND_CALLS[B.name]).toBe(calls + 2 + (B.release ? 1 : 0))
+      expect(GMP.live()).toBe(live)
+    })
+  })
 
   describe('the 16 Level 1 checks of the 5.7 hop', () => {
     const v = prover(V.checks.hop)
@@ -583,11 +700,13 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
 
   describe('Level 2 audit', () => {
     it('accepts every honest prover hop up to h13 and rejects the fabricated commitment', { timeout: 60_000 }, () => {
-      for (const v of PROVER.filter((x) => x.h_max <= 13)) expect(auditHopLevel2(claimOf(v), { kernel: K }), v.name).toEqual([])
+      for (const v of PROVER.filter((x) => x.h_max <= 13)) {
+        expect(throughBackend(B, () => auditHopLevel2(claimOf(v), { kernel: K, backend: B })), v.name).toEqual([])
+      }
       const fab = VERIFIER.find((v) => v.name === 'fabricated-commitment')!
       const level1 = verifyHopLevel1(claimOf(fab), { kernel: K })
       expect(level1[0]).toBe('residue:0')
-      expect(auditHopLevel2(claimOf(fab), { kernel: K })).toEqual(level1)
+      expect(auditHopLevel2(claimOf(fab), { kernel: K, backend: B })).toEqual(level1)
     })
 
     it('catches a seal over a list that is wrong only where no sample looked', () => {
@@ -596,7 +715,9 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
       const prev = hexToBytes(v.previous_event_id)
       const g = hopGeometry(prev, decodeCoord(v.c), decodeCoord(v.C))
       const primes = deriveHopPrimes(prev, v.m, K)
-      const residues = computeHopResidues(primes, g, exactRoots(g), K, BIGINT_BACKEND)
+      const roots = backendRoots(g, B)
+      const residues = throughBackend(B, () => computeHopResidues(primes, g, roots, K, B))
+      releaseRoots(B, roots)
       for (let wrong = 0; wrong < v.m; wrong++) {
         const mixed = residues.slice()
         setWord(mixed, wrong, (wordAt(mixed, wrong) + 1n) % (1n << 62n))
@@ -611,7 +732,7 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
         }
         const claim = claimOf({ ...v, tags })
         expect(verifyHopLevel1(claim, { kernel: K })).toEqual([])
-        expect(auditHopLevel2(claim, { kernel: K })).toEqual(['seal'])
+        expect(throughBackend(B, () => auditHopLevel2(claim, { kernel: K, backend: B }))).toEqual(['seal'])
         return
       }
       throw new Error('every position was sampled')
@@ -805,7 +926,9 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
         const roots = exactRoots(g)
         const hopN = cantorPair(cantorPair(cantorPair(roots.x, roots.y), roots.z), roots.t)
         const list = deriveHopPrimes(id, Number(g.m), K)
-        const residues = computeHopResidues(list, g, roots, K, BIGINT_BACKEND)
+        const built = backendRoots(g, B)
+        const residues = throughBackend(B, () => computeHopResidues(list, g, built, K, B))
+        releaseRoots(B, built)
         for (let j = 0; j < Number(g.m); j++) expect(wordAt(residues, j)).toBe(hopN % wordAt(list, j))
         expect(hopResidue(g, wordAt(list, 5), K)).toBe(hopN % wordAt(list, 5))
       }
@@ -814,15 +937,28 @@ describe.each(KERNELS.map((k) => [k.name, k] as const))('the %s word kernel', (_
     it('the remainder tree descends to every prime, and region_n mod Q pairs exactly', () => {
       const m = 40
       const list = deriveHopPrimes(prev, m, K)
-      const tree = BIGINT_BACKEND.productTree(list)
-      const Q = tree.levels[tree.levels.length - 1][0]
+      const live = GMP.live()
+      const tree = B.productTree(list)
+      const Q = B.toBigInt(tree.levels[tree.levels.length - 1][0])
       expect(Q).toBe(wordsOf(list).reduce((a, b) => a * b, 1n))
+      expect(tree.levels[0].map((p) => B.toBigInt(p))).toEqual(wordsOf(list))
       const x = computeSubtreeCantor(0n, 12)
-      const out = wordList(m)
-      BIGINT_BACKEND.remainders(tree, x, out)
-      for (let j = 0; j < m; j++) expect(wordAt(out, j)).toBe(x % wordAt(list, j))
       const y = computeSubtreeCantor(4096n, 11)
-      expect(BIGINT_BACKEND.pairModQ(tree, x, y)).toBe(cantorPair(x, y) % Q)
+      const X = B.fromBigInt(x), Y = B.fromBigInt(y)
+      const Xq = B.fromBigInt(x % Q), Yq = B.fromBigInt(y % Q)
+      const out = wordList(m)
+      B.remainders(tree, X, out)
+      for (let j = 0; j < m; j++) expect(wordAt(out, j)).toBe(x % wordAt(list, j))
+      // Both orders, operands above and below Q, and the inputs left as they were.
+      for (const [a, b, A, Bv] of [[x, y, X, Y], [y, x, Y, X], [x % Q, y % Q, Xq, Yq]] as const) {
+        const r = B.pairModQ(tree, A, Bv)
+        expect(B.toBigInt(r)).toBe(cantorPair(a, b) % Q)
+        B.release?.(r)
+      }
+      expect([X, Y, Xq, Yq].map((v) => B.toBigInt(v))).toEqual([x, y, x % Q, y % Q])
+      for (const v of [X, Y, Xq, Yq]) B.release?.(v)
+      B.releaseTree?.(tree)
+      expect(GMP.live()).toBe(live)
     })
 
     it('a copied proof shares no primes with another chain position', () => {
@@ -934,6 +1070,17 @@ describeBothKernels('choosing a kernel', () => {
     expect([JS_WORD_KERNEL.name, WASM_WORD_KERNEL.name]).toEqual(['js', 'wasm'])
   })
 
+  it('the exported kernels and backend are frozen: a consumer cannot replace a method or the name', () => {
+    for (const x of [JS_WORD_KERNEL, WASM_WORD_KERNEL, BIGINT_BACKEND]) {
+      expect(Object.isFrozen(x), x.name).toBe(true)
+      const open = x as unknown as Record<string, unknown>
+      expect(() => { open.name = 'patched' }).toThrow(TypeError)
+      expect(() => { open.pairMod = () => 0n }).toThrow(TypeError)
+      expect(() => { delete open.name }).toThrow(TypeError)
+    }
+    expect([JS_WORD_KERNEL.name, WASM_WORD_KERNEL.name, BIGINT_BACKEND.name]).toEqual(['js', 'wasm', 'bigint'])
+  })
+
   it('the default reaches every function that takes a kernel', () => {
     const v = prover('golden-5.7')
     const prev = hexToBytes(v.previous_event_id)
@@ -942,6 +1089,52 @@ describeBothKernels('choosing a kernel', () => {
     expect(bytesToHex(hopAttempt(prev, hexToBytes(v.seal), BigInt(v.nonce), hopPrime(prev, 0)).G)).toBe(v.G)
     expect(verifyHopLevel1(claimOf(v))).toEqual([])
     expect(findHopNonce(prev, hexToBytes(v.seal), BigInt(v.A), hopPrime(prev, 0))?.nonce).toBe(BigInt(v.nonce))
+  })
+})
+
+// ------------------------------------------------------------- the GMP adapter on its own
+
+describeBothKernels('the test-only GMP adapter', () => {
+  const next = rng(0x6a17n)
+  it('builds every tree computeSubtreeCantor builds, aligned or not, and refuses the same heights', () => {
+    const live = GMP.live()
+    for (let h = 0; h <= 12; h++) {
+      for (const base of [0n, 1n, BigInt(2 ** h), next() & ((1n << 85n) - 1n)]) {
+        const z = GMP.subtreeCantor(base, h, 30)
+        expect(GMP.toBigInt(z), `h${h} ${base}`).toBe(computeSubtreeCantor(base, h, 30))
+        GMP.release!(z)
+      }
+    }
+    expect(() => GMP.subtreeCantor(0n, 13, 12)).toThrow(/height 13 exceeds maxComputeHeight 12/)
+    expect(() => GMP.subtreeCantor(0n, -1, 12)).toThrow(/height must be >= 0/)
+    expect(GMP.live()).toBe(live)
+  })
+
+  it('converts and pairs exactly, from zero to millions of bits', () => {
+    const live = GMP.live()
+    const big = computeSubtreeCantor(1n << 84n, 14)
+    for (const v of [0n, 1n, (1n << 64n) - 1n, 1n << 64n, big]) {
+      const z = GMP.fromBigInt(v)
+      expect(GMP.toBigInt(z)).toBe(v)
+      for (const w of [0n, 7n, big]) {
+        const y = GMP.fromBigInt(w)
+        const p = GMP.pair(z, y)
+        expect(GMP.toBigInt(p)).toBe(cantorPair(v, w))
+        GMP.release!(p)
+        GMP.release!(y)
+      }
+      GMP.release!(z)
+    }
+    expect(GMP.live()).toBe(live)
+  })
+
+  it('reports progress that rises to 1', () => {
+    const seen: number[] = []
+    const z = GMP.subtreeCantor(0n, 12, 30, (f) => seen.push(f))
+    GMP.release!(z)
+    expect(seen.length).toBeGreaterThan(5)
+    for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1])
+    expect(seen[seen.length - 1]).toBe(1)
   })
 })
 
@@ -1145,6 +1338,31 @@ describeBothKernels('the two kernels agree', () => {
       const h = Number(next() % 11n)
       const base = next() & ((1n << 85n) - 1n)
       expect(X.residue(p, base % p, h, -1)).toBe(residueTree(base, h, p))
+    }
+  })
+
+  it('the engine level is clamped to its table: a k above 12 or below 0 changes no residue and overwrites nothing', async () => {
+    // The table holds 2^12 + 1 entries below the static data at 65536; before
+    // the clamp, k = 13 wrote 8193 of them and ran into it.
+    const { instance } = await WebAssembly.instantiate(wasmWordKernelBytes().buffer as ArrayBuffer, { env: { abort: () => { throw new Error('abort') } } })
+    const X = instance.exports as unknown as {
+      hopResidue(p: bigint, ...args: (bigint | number)[]): bigint
+      residue(p: bigint, baseMod: bigint, h: number, k: number): bigint
+    }
+    for (const p of MODULI.slice(0, 4)) {
+      const base = next() % p
+      for (const h of [12, 14, 16]) {
+        const plain = X.residue(p, base, h, -1)
+        for (const k of [12, 13, 14, 16, 20, 31]) expect(X.residue(p, base, h, k), `p ${p} h${h} k${k}`).toBe(plain)
+      }
+      for (const k of [-1, -5, 13, 40]) {
+        const args: (bigint | number)[] = [base, 14, k, base + 1n, 13, k, 0n, 0, k, base, 11, k]
+        const want = pairModP(pairModP(pairModP(X.residue(p, base, 14, -1), X.residue(p, base + 1n, 13, -1), p), 0n, p), X.residue(p, base, 11, -1), p)
+        expect(X.hopResidue(p, ...args), `k ${k}`).toBe(want)
+      }
+      // And the instance still gives the definition's values afterwards.
+      const b = next() & ((1n << 85n) - 1n)
+      expect(X.residue(p, b % p, 10, 4)).toBe(residueTree(b, 10, p))
     }
   })
 })

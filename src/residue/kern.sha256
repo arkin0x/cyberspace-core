@@ -1,0 +1,4 @@
+# Written by scripts/build-kernel.mjs; never edit by hand. test/residue.test.ts checks both lines.
+# assemblyscript 0.28.20: asc kern.ts -O3 --runtime stub --noAssert --memoryBase 65536
+5c6b97500649a2aa719dc3b9eb92f4ee4159b211c1ed72038765043c1aea91b0  kern.ts
+eb995709ac9549ef23512dfdfbd0349b196f5f378ec3887fbc58793823324a34  kern.wasm (the 14147 bytes of KERN_WASM_BASE64 in kernWasm.ts)

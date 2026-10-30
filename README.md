@@ -16,7 +16,8 @@ Zero runtime dependencies. Runs identically in Node, browsers and web workers, w
 | `location_encryption.ts` | Region key derivation from Cantor roots |
 | `sidestep.ts` | Merkle sidesteps, version 3: seeded trees, the re-roll price and its `mn` nonce, openings, Level 1 verification |
 | `grandfathered_v2_sidesteps.ts` | Generated: the version 2 sidesteps exempt under spec 6.16, by event id |
-| `residue.ts` | Hop proof version 2, residue openings (spec 5.9 to 5.13): hop primes, residues of a root, the seal, the re-roll price and its `mn` nonce, the `mp` openings, `computeHopProofV2`, Level 1 and Level 2 verification; the JavaScript word kernel and the BigInt backend behind the `WordKernel` and `BigBackend` interfaces |
+| `residue.ts` | Hop proof version 2, residue openings (spec 5.9 to 5.13): hop primes, residues of a root, the seal, the re-roll price and its `mn` nonce, the `mp` openings, `computeHopProofV2`, Level 1 and Level 2 verification; the JavaScript and WASM word kernels and the BigInt backend behind the `WordKernel` and `BigBackend` interfaces, and `selectWordKernel` |
+| `residue/kern.ts` | AssemblyScript source of the WASM word kernel; `residue/kernWasm.ts` is its compiled module as base64 (generated), `residue/kern.sha256` the hashes of both |
 | `grandfathered_v1_hops.ts` | Generated: the version 1 hops exempt under spec 5.13, by event id (empty until the census) |
 
 ## Usage
@@ -35,6 +36,14 @@ const proof = computeHopProof(0n, 0n, 0n, 4104n, 0n, 0n, 0, '0'.repeat(64))
 Movement cost is `O(2^h)` where `h` is the LCA height, so `computeHopProof` and
 `computeSubtreeCantor` accept an optional progress callback. Use it from a
 worker to stream live stats instead of freezing the UI.
+
+Residue openings (hop proof version 2) take a word kernel. By default every
+function uses `selectWordKernel()`: the WASM kernel wherever WebAssembly can be
+instantiated, the JavaScript kernel otherwise (for example with WebAssembly
+disabled). Both give identical values. Pass `kernel: JS_WORD_KERNEL` or
+`kernel: WASM_WORD_KERNEL` to choose, and on a page that wants WASM even where a
+synchronous compile is refused, `await loadWasmWordKernel()` once at start. The
+module is embedded in the package; nothing is fetched.
 
 ## Cantor convention
 
@@ -77,4 +86,13 @@ npm run grandfathered -- [path to cyberspace clone] [ref]
 
 # The sidestep golden vectors, from sidestep-reference.py.
 python3 scripts/sidestep-vectors.py [path to cyberspace clone] [ref] > test/fixtures/sidestep_v3.json
+```
+
+The WASM word kernel is built from `src/residue/kern.ts` with AssemblyScript
+(a devDependency pinned to one exact version) and committed, so installing from
+git needs only `tsc`. After editing `kern.ts`:
+
+```sh
+npm run build:kernel             # rewrites src/residue/kernWasm.ts and src/residue/kern.sha256
+npm run build:kernel -- --check  # rebuilds in memory; exits 1 unless the committed files match
 ```

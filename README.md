@@ -16,6 +16,8 @@ Zero runtime dependencies. Runs identically in Node, browsers and web workers, w
 | `location_encryption.ts` | Region key derivation from Cantor roots |
 | `sidestep.ts` | Merkle sidesteps, version 3: seeded trees, the re-roll price and its `mn` nonce, openings, Level 1 verification |
 | `grandfathered_v2_sidesteps.ts` | Generated: the version 2 sidesteps exempt under spec 6.16, by event id |
+| `residue.ts` | Hop proof version 2, residue openings (spec 5.9 to 5.13): hop primes, residues of a root, the seal, the re-roll price and its `mn` nonce, the `mp` openings, `computeHopProofV2`, Level 1 and Level 2 verification; the JavaScript word kernel and the BigInt backend behind the `WordKernel` and `BigBackend` interfaces |
+| `grandfathered_v1_hops.ts` | Generated: the version 1 hops exempt under spec 5.13, by event id (empty until the census) |
 
 ## Usage
 
@@ -65,12 +67,12 @@ npm run typecheck
 npm run build   # emits dist/ with declarations
 ```
 
-Two files are generated from the spec repository, read at a git ref (never the
+Three files are generated from the spec repository, read at a git ref (never the
 working tree) with the commit recorded. Fetch the clone first; both default to
 `../cyberspace` at `origin/master`.
 
 ```sh
-# The exempt version 2 sidestep ids (spec 6.16), when the list grows.
+# The exempt version 2 sidestep ids (spec 6.16) and version 1 hop ids (spec 5.13), when a list grows.
 npm run grandfathered -- [path to cyberspace clone] [ref]
 
 # The sidestep golden vectors, from sidestep-reference.py.

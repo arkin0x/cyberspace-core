@@ -119,6 +119,15 @@ npm run typecheck
 npm run build   # emits dist/ with declarations
 ```
 
+Consumers install this package from git at a pinned commit. Bump `version` in
+`package.json` (and the two matching lines in `package-lock.json`) in every
+change a consumer can see. npm compares a git dependency by version before
+anything else, and git dependencies carry no integrity hash. When a consumer's
+`node_modules` is restored from a build cache (Vercel does this) and npm's hidden
+lockfile is stale, npm fills the installed copy's metadata in from the
+consumer's lockfile. A repin to a new commit with the same version then
+reports `up to date` and keeps the old code.
+
 Three files are generated from the spec repository, read at a git ref (never the
 working tree) with the commit recorded. Fetch the clone first; both default to
 `../cyberspace` at `origin/master`.

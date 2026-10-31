@@ -18,7 +18,7 @@ Zero runtime dependencies. Runs identically in Node, browsers and web workers, w
 | `grandfathered_v2_sidesteps.ts` | Generated: the version 2 sidesteps exempt under spec 6.16, by event id |
 | `residue.ts` | Hop proof version 2, residue openings (spec 5.9 to 5.13): hop primes, residues of a root, the seal, the re-roll price and its `mn` nonce, the `mp` openings, `computeHopProofV2`, Level 1 and Level 2 verification; the JavaScript and WASM word kernels and the BigInt backend behind the `WordKernel` and `BigBackend` interfaces, and `selectWordKernel` |
 | `residue/kern.ts` | AssemblyScript source of the WASM word kernel; `residue/kernWasm.ts` is its compiled module as base64 (generated), `residue/kern.sha256` the hashes of both |
-| `grandfathered_v1_hops.ts` | Generated: the version 1 hops exempt under spec 5.13, by event id (empty until the census) |
+| `grandfathered_v1_hops.ts` | Generated: the version 1 hops exempt under spec 5.13, by event id, filled from the cutover censuses |
 
 ## Usage
 

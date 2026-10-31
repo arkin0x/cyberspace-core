@@ -107,7 +107,7 @@ import { loadGmpBackend } from './support/gmpBackend.js'
 const FIXTURE_SHA256 = '29b2222d3768b173b82887d9fb992cda23044ef84cfcfca48dd049766c7c4d33'
 // fixtures/hop-residue-vectors.json is arkin0x/cyberspace 06c287332651f99b75e609b7b098e165993750fd, hop-residue-vectors.json.
 // The spec commit the real version 1 hop list came from, its size, and the hops that census 1 audited and refused.
-const LIST_COMMIT = '8a3fc21a4e1ee4cd02262c0696a713f556cb04a2'
+const LIST_COMMIT = '9210d6dff16637079c8339a9c957c60cbd3a744e'
 const LIST_SIZE = 2658
 const AUDIT_FAILURES = [
   '66851aaed85fa1dda64d513fb1f2541a7e9201a475d341f4ea395f4c9d9b10fe',

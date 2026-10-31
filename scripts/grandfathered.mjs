@@ -41,8 +41,8 @@ const LISTS = [
  * id: an event listed here MAY lack the \`mn\` and \`mp\` tags, a verifier
  * accepts its \`proof\` (the section 5.6 proof_hash) without recomputing it,
  * and checks everything else about it as for any other hop. The list is filled
- * from the final census at the cutover to residue openings; until then it is
- * empty and no version 1 hop is exempt. Commentary per line: pubkey,
+ * from the censuses taken at the cutover to residue openings, and only hops
+ * that passed the Level 2 audit are on it. Commentary per line: pubkey,
  * created_at, heights (x,y,z), K, audit.`,
   },
 ]

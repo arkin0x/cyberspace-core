@@ -105,7 +105,22 @@ import {
 import { loadGmpBackend } from './support/gmpBackend.js'
 
 const FIXTURE_SHA256 = '29b2222d3768b173b82887d9fb992cda23044ef84cfcfca48dd049766c7c4d33'
-const SPEC_COMMIT = '06c287332651f99b75e609b7b098e165993750fd'
+// fixtures/hop-residue-vectors.json is arkin0x/cyberspace 06c287332651f99b75e609b7b098e165993750fd, hop-residue-vectors.json.
+// The spec commit the real version 1 hop list came from, its size, and the hops that census 1 audited and refused.
+const LIST_COMMIT = '8a3fc21a4e1ee4cd02262c0696a713f556cb04a2'
+const LIST_SIZE = 2658
+const AUDIT_FAILURES = [
+  '66851aaed85fa1dda64d513fb1f2541a7e9201a475d341f4ea395f4c9d9b10fe',
+  '5a96457cf9f6015c1023a330205f9d111ce578d302d560a25eee77b766c4df12',
+  'fe1d6384436c42c6d0bc436686b0a293d805244783b1d6f575e5fbca9d1c56db',
+  '6a1cdf302fdd4dabdbadeaba6ac93a276c6fb9fc1fa44404250fa1b97b76b7ea',
+  '17a1210559063ea105dd52f3e3972f8fd3fb4241b0d1368e5c73822ea7c9fbc7',
+  '93c079360fcf19cbf02c1c69ca7bd2b51dcae47d0eddfdcb143ef5a2b33af37d',
+  '8a24c20a74102aa82f73a9c75cb55609ab8c8ea9050555e80a9f35b530cd3973',
+  '97c4de2ffcda3e1ccfd433fc8862ba97c20572d9a8c40f34621c20aa9a5ed60a',
+]
+// A real listed hop that changes plane, so K comes from the destination plane.
+const REAL_V1_HOP: { id: string; tags: string[][] } = JSON.parse(readFileSync(new URL('./fixtures/grandfathered_v1_hop.json', import.meta.url), 'utf8'))
 const RAW = readFileSync(new URL('./fixtures/hop-residue-vectors.json', import.meta.url))
 const V = JSON.parse(RAW.toString('utf8'))
 
@@ -646,11 +661,28 @@ describe.each(PASSES)('the %s word kernel with the %s backend', (_kernel, _backe
       })
     }
 
-    it('the real list is generated from the spec commit, and empty until the census', () => {
-      expect(GRANDFATHERED_V1_HOPS_COMMIT).toBe(SPEC_COMMIT)
-      expect(GRANDFATHERED_V1_HOPS.size).toBe(0)
+    it('the real list is the census, from the commit its header names', () => {
+      expect(GRANDFATHERED_V1_HOPS_COMMIT).toBe(LIST_COMMIT)
+      expect(GRANDFATHERED_V1_HOPS.size).toBe(LIST_SIZE)
+      // The vectors' stand-in id is not on the real list.
       const v = V.grandfathered_v1[0]
       expect(verifyHopLevel1(claimOf(v, { eventId: v.event_id }), { kernel: K })).toEqual(['form:mn', 'form:mp'])
+    })
+
+    it('the hops that failed the census audit are not on the real list', () => {
+      for (const id of AUDIT_FAILURES) expect(GRANDFATHERED_V1_HOPS.has(id)).toBe(false)
+    })
+
+    it('a real listed hop is accepted through the real list, and its proof is the section 5.6 proof_hash', () => {
+      const tag = (name: string): string | undefined => REAL_V1_HOP.tags.find((t) => t[0] === name)?.[1]
+      const previous = REAL_V1_HOP.tags.find((t) => t[0] === 'e' && t[3] === 'previous')![1]
+      const claim = claimOf({ previous_event_id: previous, c: tag('c')!, C: tag('C')!, tags: { proof: tag('proof') } }, { eventId: REAL_V1_HOP.id })
+      expect(GRANDFATHERED_V1_HOPS.has(REAL_V1_HOP.id)).toBe(true)
+      expect(verifyHopLevel1(claim, { kernel: K })).toEqual([])
+      // A hop with the same tags and any other id is not listed.
+      expect(verifyHopLevel1({ ...claim, eventId: STAND_IN_ID }, { kernel: K })).toEqual(['form:mn', 'form:mp'])
+      const { from, to } = claim
+      expect(computeHopProof(from.x, from.y, from.z, to.x, to.y, to.z, to.plane, previous).proofHash).toBe(tag('proof'))
     })
 
     it('a listed version 1 hop is accepted through its event id, and only through it', () => {

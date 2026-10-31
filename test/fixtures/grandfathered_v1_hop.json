@@ -1,0 +1,54 @@
+{
+ "content": "",
+ "created_at": 1787677043,
+ "id": "39ab7bb9211e23dd1538814e2a54ecfa587cfd6dab8d08fb077c0c50a153017f",
+ "kind": 3333,
+ "pubkey": "1ee7928f70d59af387dd3d34a9efdfa5763d85a66f2e1f3a456ee7bac13976be",
+ "sig": "0922a7bb7ef7a6dd4b47fa4b9cc75e52af095653b079422d2afd3c4da23964063dc0a51206a5d61ad8a99f59a2e243af59a1895ce36b8482e88aa8c23d5843c5",
+ "tags": [
+  [
+   "A",
+   "hop"
+  ],
+  [
+   "e",
+   "63a589a72d27932208bdb02b3f04a764611a294ee7d8dff08b26316798477890",
+   "",
+   "genesis"
+  ],
+  [
+   "e",
+   "52ebcb6407d5c8acc5e9ca6ed87e0db108d2aa4a0b6db6d5e2c26e1f0602732c",
+   "",
+   "previous"
+  ],
+  [
+   "c",
+   "1ee7928f70d59af387dd3d34a9efdfa5763d85a66f2e1f3a45ece69b85d808a6"
+  ],
+  [
+   "C",
+   "1ee7928f70d59af387dd3d34a9efdfa5763d85a66f2e1f3a45ece69ba3654d03"
+  ],
+  [
+   "proof",
+   "41db8b143ffb5c0eed614a83dfc86be782c169b44aeee94795855441d3ca3a29"
+  ],
+  [
+   "X",
+   "16423383303375297"
+  ],
+  [
+   "Y",
+   "13435117217226012"
+  ],
+  [
+   "Z",
+   "14683551116553655"
+  ],
+  [
+   "S",
+   "16423383303375297-13435117217226012-14683551116553655"
+  ]
+ ]
+}

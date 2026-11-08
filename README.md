@@ -114,10 +114,25 @@ byte-identical results to the Python implementation.
 
 ```sh
 npm install
-npm test        # golden vectors
+npm test             # golden vectors
 npm run typecheck
-npm run build   # emits dist/ with declarations
+npm run build:dist   # rewrites dist/ (with declarations) from src/
+npm run check:dist   # rebuilds dist/; exits 1 unless the committed dist/ matches
 ```
+
+`dist/` is committed, built from `src/` by `npm run build:dist`. Rebuild it and
+commit it with every change to `src/`; `check:dist` (and CI) fails when the two
+disagree. The build is reproducible: the same `src/` and the same locked `tsc`
+give the same bytes.
+
+That is what lets a git install skip building. npm runs a full install of a git
+dependency, devDependencies and all, and then its `prepare`, whenever its
+package.json has a `build`, `prepare`, `prepack`, `install`, `preinstall` or
+`postinstall` script. This package has none of them (the build is `build:dist`),
+so a consumer's install clones the pinned commit and uses `dist/` as it is: no
+`tsc`, no devDependencies. That also fixes `npm i -g` of a package that depends
+on this one from git, whose nested `prepare` could not find `tsc`.
+`typescript` is only a devDependency.
 
 Consumers install this package from git at a pinned commit. Bump `version` in
 `package.json` (and the two matching lines in `package-lock.json`) in every
@@ -141,8 +156,8 @@ python3 scripts/sidestep-vectors.py [path to cyberspace clone] [ref] > test/fixt
 ```
 
 The WASM word kernel is built from `src/residue/kern.ts` with AssemblyScript
-(a devDependency pinned to one exact version) and committed, so installing from
-git needs only `tsc`. After editing `kern.ts`:
+(a devDependency pinned to one exact version) and committed, like `dist/`, so
+installing from git builds nothing. After editing `kern.ts` (then `build:dist`):
 
 ```sh
 npm run build:kernel             # rewrites src/residue/kernWasm.ts and src/residue/kern.sha256

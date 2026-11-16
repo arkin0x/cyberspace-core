@@ -12,7 +12,7 @@
  * (16 bits, 2 per doubling of reach, 3 per doubling of vertices plus faces
  * beyond 32). A miner that varies the end of the content hashes one SHA-256
  * block per try at any size, which made that price meaningless, so it was
- * dropped. avatarWork, avatarBits and the miner are gone; verifyAvatarWork
+ * dropped. avatarWork and the price constants are gone; verifyAvatarWork
  * stays one release as a deprecated alias of verifyAvatar that never
  * checks work.
  */

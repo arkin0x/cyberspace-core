@@ -14,8 +14,8 @@ import {
 
 const RAW = readFileSync(new URL('./fixtures/avatar-vectors.json', import.meta.url), 'utf8')
 /** The spec commit the file was copied from (PR #109's branch; re-pin to its merge commit), and its hash. */
-export const AVATAR_VECTORS_SPEC_COMMIT = '938b1050320de6afce5d3646a1c2c06166744e02'
-const AVATAR_VECTORS_SHA256 = '22830c6e13ef4f259337197624ba52e8cdf96f5ef66449adb2386939ae84725f'
+const AVATAR_VECTORS_SPEC_COMMIT = '1420330d9b30d77ce714db5cb5330393b084e151'
+const AVATAR_VECTORS_SHA256 = '3f2b9220470d58b335dcd61b27d30d66afb08f484d63d4acbd8a93b6b4febf0e'
 
 interface Ev { kind: number; id: string; pubkey: string; created_at: number; tags: string[][]; content: string | null; content_recipe?: { prefix: string; fill: string; count: number; suffix: string } }
 interface Vectors {
@@ -29,6 +29,7 @@ const content = (e: Ev): string => e.content ?? `${e.content_recipe!.prefix}${e.
 
 describe('the vectors', () => {
   it('are the spec file, unchanged', () => {
+    expect(AVATAR_VECTORS_SPEC_COMMIT).toMatch(/^[0-9a-f]{40}$/)
     expect(createHash('sha256').update(RAW).digest('hex')).toBe(AVATAR_VECTORS_SHA256)
   })
   it('carry the constants this module uses', () => {
@@ -90,9 +91,19 @@ describe('verifyAvatarWork (deprecated)', () => {
   })
 })
 
+describe('verifyAvatarWork never throws on what it only displays', () => {
+  it('takes junk tags and ids', () => {
+    const content = '{"vertices":[[0,0,0]]}'
+    for (const e of [{ tags: 'x' }, { tags: 5 }, { tags: [null, ['nonce']] }, { id: null }, { id: 5 }, { tags: [['nonce', '0', '9'.repeat(5000)]] }]) {
+      const ev = { kind: AVATAR_KIND, id: '00ff', tags: [] as string[][], content, ...e } as unknown as Parameters<typeof verifyAvatarWork>[0]
+      expect(verifyAvatarWork(ev).ok).toBe(true)
+    }
+  })
+})
+
 describe('the price is gone', () => {
-  it('exports no work function and no miner', () => {
-    for (const name of ['avatarWork', 'avatarBits', 'AVATAR_FLOOR_BITS', 'AVATAR_DETAIL_BITS', 'AvatarTailMiner', 'mineAvatarTail']) {
+  it('exports no work function', () => {
+    for (const name of ['avatarWork', 'AVATAR_FLOOR_BITS', 'AVATAR_SIZE_BITS', 'AVATAR_DETAIL_BITS', 'AVATAR_DETAIL_FREE']) {
       expect((core as Record<string, unknown>)[name]).toBeUndefined()
     }
   })
@@ -103,6 +114,7 @@ describe('avatarReach and avatarReadable', () => {
     expect(avatarReach({ unit: 0, vertices: [[0, 0, 0], [-1, -1, -1]], ticks: [[60, 60, 60], [60, 60, 60]] })).toBeCloseTo(0.5, 9)
     expect(avatarReach({ unit: 2, vertices: [[4, 0, 0]] })).toBe(16)
     expect(avatarReach({ vertices: [[3, 0, 0], [0, 0, 0]], ticks: [-2] })).toBe(3)
+    expect(avatarReach({ unit: 2000, vertices: [[0, 0, 0]] })).toBe(0)
   })
   it('readable refuses what is not a payload', () => {
     expect(avatarReadable({ vertices: [[0, 0, 0]] })).toBe(true)

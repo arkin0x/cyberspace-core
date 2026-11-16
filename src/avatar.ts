@@ -12,7 +12,7 @@
  * (16 bits, 2 per doubling of reach, 3 per doubling of vertices plus faces
  * beyond 32). A miner that varies the end of the content hashes one SHA-256
  * block per try at any size, which made that price meaningless, so it was
- * dropped. avatarWork, avatarBits and the miner are gone; verifyAvatarWork
+ * dropped. avatarWork and the price constants are gone; verifyAvatarWork
  * stays one release as a deprecated alias of verifyAvatar that never
  * checks work.
  */
@@ -80,7 +80,7 @@ export function avatarReach(payload: AvatarPayload): number {
   payload.vertices.forEach((p, i) => {
     for (let a = 0; a < 3; a++) reach = Math.max(reach, Math.abs((p[a] ?? 0) + (ticks[i][a] ?? 0) / TICKS_PER_UNIT))
   })
-  return reach * 2 ** unit
+  return reach === 0 ? 0 : reach * 2 ** unit
 }
 
 const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
@@ -165,7 +165,10 @@ export interface AvatarVerdict {
  * checks work; it reports the nonce tag and the id's zeros for display only.
  */
 export function verifyAvatarWork(event: { kind: number; id: string; tags: string[][]; content: string }): AvatarVerdict {
-  const nonce = event.tags.find((t) => t[0] === 'nonce')
-  const committed = nonce && /^[0-9]+$/.test(nonce[2] ?? '') ? Number(nonce[2]) : null
-  return { ...verifyAvatar(event), required: 0, committed, zeros: leadingZeroBits(event.id) }
+  // Display only, so it never throws on what the verdict does not read.
+  const tags: unknown[] = Array.isArray(event.tags) ? event.tags : []
+  const nonce = tags.find((t): t is unknown[] => Array.isArray(t) && t[0] === 'nonce')
+  const target = nonce?.[2]
+  const committed = typeof target === 'string' && /^[0-9]{1,15}$/.test(target) ? Number(target) : null
+  return { ...verifyAvatar(event), required: 0, committed, zeros: typeof event.id === 'string' ? leadingZeroBits(event.id) : 0 }
 }

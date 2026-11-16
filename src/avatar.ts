@@ -8,24 +8,45 @@
  * hash and a walk over the vertices, and draws the dodecahedron instead for
  * an avatar that has not paid.
  *
- *   required = ceil(FLOOR + SIZE_BITS * log2(reach) + DETAIL_BITS * log2(detail / 32))
+ *   required = ceil(10 + 2 log2(reach) + 1.5 log2(detail / 32))
  *
  * reach is the farthest vertex from the build origin in gibsons at true
  * scale (a model unit is 2^unit gibsons), never below one; detail is the
- * vertex count plus the face count, never below 32. The floor is planned on
- * a hundred-year horizon of growing hash power; reach is priced hardest
+ * vertex count plus the face count, never below 32. The terms are summed as
+ * real numbers and the total is rounded up once. Reach is priced hardest
  * because a large avatar is the one that gets in everyone's way. Bytes are
- * charged as well without a term, since every nonce hashes the whole event.
+ * not priced by the work (a miner that varies the end of the content pays
+ * the same per try at any size, avatarMine.ts); the content limit bounds
+ * them instead. The floor is no spam guard: a relay limits how often one
+ * key replaces its avatar.
+ *
+ * Until 2026-11 the floor was 16 bits and detail 3 bits per doubling, set
+ * while SNO still capped an object at 512 vertices and 1,024 faces. No
+ * shape costs more now than it did then, so every avatar published before
+ * the change stays paid.
  */
 
 /** Bits every avatar owes, whatever its shape. */
-export const AVATAR_FLOOR_BITS = 16
+export const AVATAR_FLOOR_BITS = 10
 /** Bits per doubling of reach. */
 export const AVATAR_SIZE_BITS = 2
-/** Bits per doubling of vertices plus faces beyond DETAIL_FREE. */
-export const AVATAR_DETAIL_BITS = 3
+/** Bits per doubling of vertices plus faces beyond DETAIL_FREE (three per fourfold). */
+export const AVATAR_DETAIL_BITS = 1.5
 /** Vertices plus faces that cost nothing. */
 export const AVATAR_DETAIL_FREE = 32
+/**
+ * The most bytes an avatar's content may hold, counted as UTF-8 (128 KiB),
+ * a trailing `nonce` field included. A reader draws the default avatar for
+ * a larger one, whatever work it carries.
+ */
+export const AVATAR_CONTENT_MAX = 131_072
+/**
+ * Above this many bytes of content a publishing client warns that some
+ * remote signers (NIP-46) may refuse the event: older NIP-44 libraries
+ * encrypt at most 65,535 bytes, and the request carries the whole event.
+ * Spec 8.10, non-normative.
+ */
+export const AVATAR_CONTENT_WARN = 65_536
 /**
  * Replaceable: one avatar per pubkey, the newest wins, no `d` tag.
  *
@@ -74,11 +95,30 @@ export function avatarReach(payload: AvatarPayload): number {
   return reach * 2 ** unit
 }
 
+/** Vertices plus faces, before the free allowance. */
+export function avatarDetail(payload: AvatarPayload): number {
+  return payload.vertices.length + (payload.faces?.length ?? 0)
+}
+
+/**
+ * The bits owed for a reach in gibsons and a detail (vertices plus faces):
+ * the floor, two bits per doubling of reach beyond one gibson, one and a
+ * half per doubling of detail beyond 32, summed and rounded up once.
+ */
+export function avatarBits(reach: number, detail: number): number {
+  const r = Math.max(1, reach)
+  const d = Math.max(AVATAR_DETAIL_FREE, detail)
+  return Math.ceil(AVATAR_FLOOR_BITS + AVATAR_SIZE_BITS * Math.log2(r) + AVATAR_DETAIL_BITS * Math.log2(d / AVATAR_DETAIL_FREE))
+}
+
 /** The leading zero bits the avatar's event id must carry. */
 export function avatarWork(payload: AvatarPayload): number {
-  const reach = Math.max(1, avatarReach(payload))
-  const detail = Math.max(AVATAR_DETAIL_FREE, payload.vertices.length + (payload.faces?.length ?? 0))
-  return Math.ceil(AVATAR_FLOOR_BITS + AVATAR_SIZE_BITS * Math.log2(reach) + AVATAR_DETAIL_BITS * Math.log2(detail / AVATAR_DETAIL_FREE))
+  return avatarBits(avatarReach(payload), avatarDetail(payload))
+}
+
+/** The content's length as the limit counts it: UTF-8 bytes. */
+export function avatarContentBytes(content: string): number {
+  return new TextEncoder().encode(content).length
 }
 
 /** Leading zero bits of a hex string, as NIP-13 counts them. */
@@ -102,18 +142,25 @@ export interface AvatarVerdict {
   committed: number | null
   /** What the id actually carries. */
   zeros: number
-  reason: 'ok' | 'not-an-avatar' | 'no-nonce' | 'under-committed' | 'unpaid'
+  reason: 'ok' | 'not-an-avatar' | 'too-large' | 'no-nonce' | 'under-committed' | 'unpaid'
 }
 
 /**
- * Whether an avatar event has paid for its shape (NIP-13): the nonce tag's
- * committed target covers what the shape owes, and the id carries at least
- * the committed zeros. Committing matters: a lucky id must not be claimed
- * against a lower bar than it was mined for.
+ * Whether an avatar event has paid for its shape (NIP-13): the content is
+ * within AVATAR_CONTENT_MAX, the nonce tag's committed target covers what
+ * the shape owes, and the id carries at least the committed zeros.
+ * Committing matters: a lucky id must not be claimed against a lower bar
+ * than it was mined for. The length is checked before the content is
+ * parsed. Only the committed target is read from the nonce tag, never its
+ * first value: a miner may vary the nonce anywhere (avatarMine.ts puts it
+ * at the end of the content and writes "0" in the tag).
  */
 export function verifyAvatarWork(event: { kind: number; id: string; tags: string[][]; content: string }): AvatarVerdict {
   const zeros = leadingZeroBits(event.id)
   if (event.kind !== AVATAR_KIND) return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' }
+  if (event.content.length > AVATAR_CONTENT_MAX || avatarContentBytes(event.content) > AVATAR_CONTENT_MAX) {
+    return { ok: false, required: 0, committed: null, zeros, reason: 'too-large' }
+  }
   let payload: AvatarPayload
   try {
     const raw = JSON.parse(event.content) as Partial<AvatarPayload>

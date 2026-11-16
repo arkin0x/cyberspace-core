@@ -18,3 +18,17 @@ file was added). The test asserts both.
 
 The file is not normative (CYBERSPACE_V2.md section 14): where it disagrees with
 the spec text, the text is right and the file is a bug.
+
+## avatar-vectors.json
+
+Copied unchanged from the spec repository, arkin0x/cyberspace at commit
+`9caa0c4` (branch `avatar-pow-base10`, `avatar-vectors.json`, written by
+`avatar-reference.py`). Never edit it here; to update it, copy the file again
+from a newer spec commit and change the commit and the hash in
+`test/avatar.test.ts`, which asserts the hash. The Python core
+(cyberspace-cli) carries the same file.
+
+- sha256: `8ba4852221e3ebb8a4f88d63c1ce36cba959e250b691cc2a212f27393760b955`
+
+The file is not normative (CYBERSPACE_V2.md section 14): where it disagrees with
+the spec text, the text is right and the file is a bug.

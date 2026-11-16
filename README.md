@@ -19,6 +19,8 @@ Zero runtime dependencies. Runs identically in Node, browsers and web workers, w
 | `residue.ts` | Hop proof version 2, residue openings (spec 5.9 to 5.13): hop primes, residues of a root, the seal, the re-roll price and its `mn` nonce, the `mp` openings, `computeHopProofV2`, Level 1 and Level 2 verification; the JavaScript and WASM word kernels and the BigInt backend behind the `WordKernel` and `BigBackend` interfaces, and `selectWordKernel` |
 | `residue/kern.ts` | AssemblyScript source of the WASM word kernel; `residue/kernWasm.ts` is its compiled module as base64 (generated), `residue/kern.sha256` the hashes of both |
 | `grandfathered_v1_hops.ts` | Generated: the version 1 hops exempt under spec 5.13, by event id, filled from the cutover censuses |
+| `avatar.ts` | The work an avatar owes (spec 8.10): `avatarBits`, `avatarWork`, the 128 KiB content limit and `verifyAvatarWork` |
+| `avatarMine.ts` | The avatar miner with the nonce at the end of the content: one SHA-256 block per try from a midstate, whatever the avatar's size; finds what the spec's `avatar-reference.py` finds |
 
 ## Usage
 

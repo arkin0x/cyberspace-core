@@ -1,43 +1,25 @@
 /**
- * avatar.ts - the work an avatar owes (kind 11333).
+ * avatar.ts - what a reader checks on an avatar (kind 11333, spec 8.10).
  *
- * An avatar is drawn on every screen near its owner whether they like it or
- * not, so its size and its detail are paid for in proof of work on the event
- * itself, NIP-13 style: the event id must carry `required` leading zero bits,
- * with the target committed in a `nonce` tag. Any viewer verifies with one
- * hash and a walk over the vertices, and draws the dodecahedron instead for
- * an avatar that has not paid.
+ * An avatar carries no proof of work (owner ruling 2026-11-16). A reader
+ * draws it when its content is within AVATAR_CONTENT_MAX bytes of UTF-8 and
+ * holds a payload the reader can read, and draws its default avatar for that
+ * identity otherwise. A `nonce` tag, which avatars published before 2026-11
+ * carry, is ignored: no verdict reads a tag. Relays limit how often one key
+ * replaces its avatar; viewers mute.
  *
- *   required = ceil(10 + 2 log2(reach) + 1.5 log2(detail / 32))
- *
- * reach is the farthest vertex from the build origin in gibsons at true
- * scale (a model unit is 2^unit gibsons), never below one; detail is the
- * vertex count plus the face count, never below 32. The terms are summed as
- * real numbers and the total is rounded up once. Reach is priced hardest
- * because a large avatar is the one that gets in everyone's way. Bytes are
- * not priced by the work (a miner that varies the end of the content pays
- * the same per try at any size, avatarMine.ts); the content limit bounds
- * them instead. The floor is no spam guard: a relay limits how often one
- * key replaces its avatar.
- *
- * Until 2026-11 the floor was 16 bits and detail 3 bits per doubling, set
- * while SNO still capped an object at 512 vertices and 1,024 faces. No
- * shape costs more now than it did then, so every avatar published before
- * the change stays paid.
+ * Until 2026-11 an avatar paid NIP-13 work priced by its reach and detail
+ * (16 bits, 2 per doubling of reach, 3 per doubling of vertices plus faces
+ * beyond 32). A miner that varies the end of the content hashes one SHA-256
+ * block per try at any size, which made that price meaningless, so it was
+ * dropped. avatarWork, avatarBits and the miner are gone; verifyAvatarWork
+ * stays one release as a deprecated alias of verifyAvatar that never
+ * checks work.
  */
 
-/** Bits every avatar owes, whatever its shape. */
-export const AVATAR_FLOOR_BITS = 10
-/** Bits per doubling of reach. */
-export const AVATAR_SIZE_BITS = 2
-/** Bits per doubling of vertices plus faces beyond DETAIL_FREE (three per fourfold). */
-export const AVATAR_DETAIL_BITS = 1.5
-/** Vertices plus faces that cost nothing. */
-export const AVATAR_DETAIL_FREE = 32
 /**
- * The most bytes an avatar's content may hold, counted as UTF-8 (128 KiB),
- * a trailing `nonce` field included. A reader draws the default avatar for
- * a larger one, whatever work it carries.
+ * The most bytes an avatar's content may hold, counted as UTF-8 (128 KiB).
+ * A reader draws the default avatar for a larger one.
  */
 export const AVATAR_CONTENT_MAX = 131_072
 /**
@@ -48,6 +30,7 @@ export const AVATAR_CONTENT_MAX = 131_072
  * bytes of content. Spec 8.10, non-normative.
  */
 export const AVATAR_CONTENT_WARN = 64_000
+
 /**
  * Replaceable: one avatar per pubkey, the newest wins, no `d` tag.
  *
@@ -63,7 +46,7 @@ export const AVATAR_KIND = 11333
 /** Ticks in a model unit, as the shard payload divides them. */
 const TICKS_PER_UNIT = 120
 
-/** What the price reads from a shard payload: the parts of it that matter. */
+/** The parts of a shard payload a reader checks here and reach reads. */
 export interface AvatarPayload {
   /** A model unit is 2^unit gibsons. */
   unit?: number
@@ -119,27 +102,6 @@ export function avatarReadable(payload: unknown): payload is AvatarPayload {
   return p.faces == null || Array.isArray(p.faces)
 }
 
-/** Vertices plus faces, before the free allowance. */
-export function avatarDetail(payload: AvatarPayload): number {
-  return payload.vertices.length + (payload.faces?.length ?? 0)
-}
-
-/**
- * The bits owed for a reach in gibsons and a detail (vertices plus faces):
- * the floor, two bits per doubling of reach beyond one gibson, one and a
- * half per doubling of detail beyond 32, summed and rounded up once.
- */
-export function avatarBits(reach: number, detail: number): number {
-  const r = Math.max(1, reach)
-  const d = Math.max(AVATAR_DETAIL_FREE, detail)
-  return Math.ceil(AVATAR_FLOOR_BITS + AVATAR_SIZE_BITS * Math.log2(r) + AVATAR_DETAIL_BITS * Math.log2(d / AVATAR_DETAIL_FREE))
-}
-
-/** The leading zero bits the avatar's event id must carry. */
-export function avatarWork(payload: AvatarPayload): number {
-  return avatarBits(avatarReach(payload), avatarDetail(payload))
-}
-
 const utf8 = new TextEncoder()
 
 /** The content's length as the limit counts it: UTF-8 bytes (a lone surrogate counts three). */
@@ -160,49 +122,50 @@ export function leadingZeroBits(hex: string): number {
   return n
 }
 
-export interface AvatarVerdict {
+/** Why a reader draws an avatar event, or draws the default instead. */
+export interface AvatarCheck {
   ok: boolean
-  /** What the shape owes. */
-  required: number
-  /** What the nonce tag commits to; null without a well-formed tag. */
-  committed: number | null
-  /** What the id actually carries. */
-  zeros: number
-  reason: 'ok' | 'not-an-avatar' | 'too-large' | 'no-nonce' | 'under-committed' | 'unpaid'
+  reason: 'ok' | 'not-an-avatar' | 'too-large'
 }
 
 /**
- * Whether an avatar event has paid for its shape (NIP-13): the content is
- * within AVATAR_CONTENT_MAX, the nonce tag's committed target covers what
- * the shape owes, and the id carries at least the committed zeros.
- * Committing matters: a lucky id must not be claimed against a lower bar
- * than it was mined for. The length is checked before the content is
- * parsed. Only the committed target is read from the nonce tag, never its
- * first value: a miner may vary the nonce anywhere (avatarMine.ts puts it
- * at the end of the content and writes "0" in the tag).
+ * Whether a reader draws this avatar event (spec 8.10): the kind is 11333,
+ * the content is within AVATAR_CONTENT_MAX (checked before parsing) and it
+ * holds a payload the reader can read (avatarReadable). Tags are not read.
+ * Empty content is the default avatar, the caller's to handle first; here it
+ * is not-an-avatar, as any content that is not a payload is.
  */
-export function verifyAvatarWork(event: { kind: number; id: string; tags: string[][]; content: string }): AvatarVerdict {
-  const zeros = leadingZeroBits(event.id)
-  if (event.kind !== AVATAR_KIND) return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' }
+export function verifyAvatar(event: { kind: number; content: string }): AvatarCheck {
+  if (event.kind !== AVATAR_KIND || typeof event.content !== 'string') return { ok: false, reason: 'not-an-avatar' }
   // UTF-8 never takes fewer bytes than UTF-16 code units, and never more than three per unit.
   const len = event.content.length
   if (len > AVATAR_CONTENT_MAX || (len * 3 > AVATAR_CONTENT_MAX && avatarContentBytes(event.content) > AVATAR_CONTENT_MAX)) {
-    return { ok: false, required: 0, committed: null, zeros, reason: 'too-large' }
+    return { ok: false, reason: 'too-large' }
   }
-  let payload: AvatarPayload
-  try {
-    const raw: unknown = JSON.parse(event.content)
-    if (!avatarReadable(raw)) return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' }
-    payload = raw
-  } catch {
-    return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' }
-  }
-  const required = avatarWork(payload)
-  if (Number.isNaN(required)) return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' }
+  let raw: unknown
+  try { raw = JSON.parse(event.content) } catch { return { ok: false, reason: 'not-an-avatar' } }
+  return avatarReadable(raw) ? { ok: true, reason: 'ok' } : { ok: false, reason: 'not-an-avatar' }
+}
+
+/** The old verdict's shape, kept for verifyAvatarWork. */
+export interface AvatarVerdict {
+  ok: boolean
+  /** Always 0: an avatar owes no work. */
+  required: number
+  /** What a nonce tag commits to, if one is there; never read for the verdict. */
+  committed: number | null
+  /** Leading zero bits of the id; never read for the verdict. */
+  zeros: number
+  reason: AvatarCheck['reason']
+}
+
+/**
+ * @deprecated An avatar carries no proof of work (spec 8.10, 2026-11-16).
+ * Use verifyAvatar. This alias reaches verifyAvatar's verdict and never
+ * checks work; it reports the nonce tag and the id's zeros for display only.
+ */
+export function verifyAvatarWork(event: { kind: number; id: string; tags: string[][]; content: string }): AvatarVerdict {
   const nonce = event.tags.find((t) => t[0] === 'nonce')
-  const committed = nonce && /^\d+$/.test(nonce[2] ?? '') ? Number(nonce[2]) : null
-  if (committed === null) return { ok: false, required, committed, zeros, reason: 'no-nonce' }
-  if (committed < required) return { ok: false, required, committed, zeros, reason: 'under-committed' }
-  if (zeros < committed) return { ok: false, required, committed, zeros, reason: 'unpaid' }
-  return { ok: true, required, committed, zeros, reason: 'ok' }
+  const committed = nonce && /^[0-9]+$/.test(nonce[2] ?? '') ? Number(nonce[2]) : null
+  return { ...verifyAvatar(event), required: 0, committed, zeros: leadingZeroBits(event.id) }
 }

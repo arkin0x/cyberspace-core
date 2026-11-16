@@ -22,5 +22,4 @@ export * from './residue.js';
 export * from './grandfathered_v1_hops.js';
 export * from './location_encryption.js';
 export * from './avatar.js';
-export * from './avatarMine.js';
 //# sourceMappingURL=index.js.map

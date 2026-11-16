@@ -22,14 +22,14 @@ the spec text, the text is right and the file is a bug.
 ## avatar-vectors.json
 
 Copied unchanged from the spec repository, arkin0x/cyberspace at commit
-`7dd2ce1559a5233acc49492a0b9c5d15680c1908` (branch `avatar-pow-base10` of PR
+`938b1050320de6afce5d3646a1c2c06166744e02` (branch `avatar-pow-base10` of PR
 #109, `avatar-vectors.json`, written by `avatar-reference.py`). Re-pin to the
 merge commit on master once #109 merges. Never edit it here; to update it, copy the file again
 from a newer spec commit and change the commit and the hash in
 `test/avatar.test.ts`, which asserts the hash. The Python core
 (cyberspace-cli) carries the same file.
 
-- sha256: `37d176493a1d304a3f2fcd9cf84b04e91a13a7a5bf5f8e639f73e983463fcbd5`
+- sha256: `22830c6e13ef4f259337197624ba52e8cdf96f5ef66449adb2386939ae84725f`
 
 The file is not normative (CYBERSPACE_V2.md section 14): where it disagrees with
 the spec text, the text is right and the file is a bug.

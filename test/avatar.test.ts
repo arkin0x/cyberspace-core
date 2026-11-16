@@ -13,8 +13,8 @@ import {
 
 const RAW = readFileSync(new URL('./fixtures/avatar-vectors.json', import.meta.url), 'utf8')
 /** The spec commit the file was copied from, and its hash: copy it again to update, never edit it here. */
-export const AVATAR_VECTORS_SPEC_COMMIT = '9caa0c4'
-const AVATAR_VECTORS_SHA256 = '8ba4852221e3ebb8a4f88d63c1ce36cba959e250b691cc2a212f27393760b955'
+export const AVATAR_VECTORS_SPEC_COMMIT = '7dd2ce1559a5233acc49492a0b9c5d15680c1908'
+const AVATAR_VECTORS_SHA256 = '37d176493a1d304a3f2fcd9cf84b04e91a13a7a5bf5f8e639f73e983463fcbd5'
 
 interface PriceRow { reach: number; detail?: number; vertices?: number; faces?: number; required: number; required_before_2026_11: number; name?: string; refused?: boolean; bytes?: number }
 interface Verdict { ok: boolean; required: number; committed: number | null; zeros: number; reason: string }
@@ -54,8 +54,8 @@ describe('avatarBits', () => {
     it(`reach ${v.reach}, detail ${v.detail}: ${v.required} bits`, () => expect(avatarBits(v.reach, v.detail)).toBe(v.required))
   }
   it('rounds the sum up once, not each term', () => {
-    // 2 log2(1.5) + 1.5 log2(48 / 32) is 1.17 + 0.88: 10 + 2.05 rounds up to 13, not 12.
-    expect(avatarBits(1.5, 48)).toBe(13)
+    // 2 log2(1.1) + 1.5 log2(40 / 32) is 0.275 + 0.483: 10.76 rounds up to 11; each term rounded up would make 12.
+    expect(avatarBits(1.1, 40)).toBe(11)
   })
   it('prices the ladder the spec quotes, and nothing under a gibson or under 32', () => {
     expect([1, 2, 4, 16, 1000].map((r) => avatarBits(r, 32))).toEqual([10, 12, 14, 18, 30])
@@ -74,6 +74,35 @@ describe('the avatar study corpus', () => {
       expect(v.bytes > AVATAR_CONTENT_MAX).toBe(v.refused)
     })
   }
+})
+
+describe('the content limit', () => {
+  for (const v of V.content_limit) {
+    it(`${v.bytes} bytes: ${v.refused ? 'refused' : 'drawn'}`, () => {
+      const prefix = '{"vertices":[[0,0,0]],"pad":"'
+      const body = v.bytes < prefix.length + 2 ? '{"vertices":[[0,0,0]]}' : `${prefix}${'a'.repeat(v.bytes - prefix.length - 2)}"}`
+      const r = verifyAvatarWork({ kind: AVATAR_KIND, id: '0'.repeat(64), tags: [['nonce', '0', '10']], content: body })
+      expect(r.reason === 'too-large').toBe(v.refused)
+    })
+  }
+  it('is checked before the content is parsed', () => {
+    const r = verifyAvatarWork({ kind: AVATAR_KIND, id: '0'.repeat(64), tags: [['nonce', '0', '10']], content: 'x'.repeat(AVATAR_CONTENT_MAX + 1) })
+    expect(r.reason).toBe('too-large')
+  })
+})
+
+describe('unreadable payloads', () => {
+  it('never price at NaN, never pass, never throw', () => {
+    for (const body of ['{"vertices":[["x",0,0],[1000000,0,0]]}', '{"vertices":[null]}', '{"vertices":[[0,0,0]],"ticks":[null]}', '{"vertices":[[0,0,0]],"ticks":[{"a":1}]}', '{"vertices":[[0,0,0]],"faces":5}']) {
+      expect(verifyAvatarWork({ kind: AVATAR_KIND, id: '0'.repeat(64), tags: [['nonce', '0', '0']], content: body }).reason).toBe('not-an-avatar')
+    }
+  })
+  it('stop a long run of ticks at the vertex count', () => {
+    const t0 = Date.now()
+    const r = verifyAvatarWork({ kind: AVATAR_KIND, id: '0'.repeat(64), tags: [['nonce', '0', '10']], content: '{"vertices":[[0,0,0]],"ticks":[-1e300]}' })
+    expect(r.ok).toBe(true)
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
 })
 
 describe('leadingZeroBits', () => {

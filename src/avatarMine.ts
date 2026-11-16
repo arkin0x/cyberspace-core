@@ -43,23 +43,39 @@ export interface AvatarMineFound {
 export const AVATAR_NONCE_DIGITS_MAX = 16
 
 /**
- * The most bytes mining adds to the content: `,"nonce":"` and `"`, up to 63
- * leading zeros and AVATAR_NONCE_DIGITS_MAX digits. A content within
- * AVATAR_CONTENT_MAX less this always fits the limit once mined.
+ * The bytes of the serialization after the nonce's digits: the content's
+ * closing `"}`, escaped inside the event's JSON as `\"}`, then `"]`.
  */
-export const AVATAR_NONCE_ROOM = 10 + 1 + 63 + AVATAR_NONCE_DIGITS_MAX
+const POST_BYTES = 5
+/**
+ * The most bytes mining adds to a content that holds no nonce yet:
+ * `,"nonce":"` and `"` (11), the zeros that lead the digits (fewer than
+ * 64 - (64 - AVATAR_NONCE_DIGITS_MAX - POST_BYTES - 9), so at most 29) and
+ * AVATAR_NONCE_DIGITS_MAX digits: 56. A content within AVATAR_CONTENT_MAX
+ * less this always fits the limit once mined; avatarTailSplit refuses one
+ * that would not.
+ */
+export const AVATAR_NONCE_ROOM = 11 + (AVATAR_NONCE_DIGITS_MAX + POST_BYTES + 9 - 1) + AVATAR_NONCE_DIGITS_MAX
+
+import { AVATAR_CONTENT_MAX, avatarContentBytes } from './avatar.js'
 
 const MARK = '\u0000NONCE\u0000'
 const enc = new TextEncoder()
 
+const MINED_TAIL = /,"nonce":"[0-9]+"(\}\s*)$/
+const MINED_ONLY = /^(\{\s*)"nonce":"[0-9]+"(\}\s*)$/
+
 /**
- * The content with `nonce` as the last field of its payload; an earlier
- * `nonce` field is dropped. Throws when the content is not a JSON object.
+ * The content with `nonce` as the last field of its payload. A nonce this
+ * miner wrote before (the content ends with it) is cut off as text, so the
+ * rest stays byte for byte; any other `nonce` field is dropped by writing
+ * the payload again. Throws when the content is not a JSON object.
  */
 export function avatarTailContent(content: string, nonce: string): string {
-  const payload: unknown = JSON.parse(content)
+  const cut = content.replace(MINED_TAIL, '$1').replace(MINED_ONLY, '$1$2')
+  const payload: unknown = JSON.parse(cut)
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('the content is not a JSON object')
-  let text = content
+  let text = cut
   if (Object.prototype.hasOwnProperty.call(payload, 'nonce')) {
     delete (payload as Record<string, unknown>).nonce
     text = JSON.stringify(payload)
@@ -108,6 +124,8 @@ export function avatarTailSplit(template: AvatarMineTemplate, target: number): A
   const post = enc.encode(ser.slice(at + mark.length))
   const rem = pre.length % 64
   const lead = rem + AVATAR_NONCE_DIGITS_MAX + post.length + 9 > 64 ? '0'.repeat(64 - rem) : ''
+  const worst = avatarTailContent(template.content, lead + '9'.repeat(AVATAR_NONCE_DIGITS_MAX))
+  if (avatarContentBytes(worst) > AVATAR_CONTENT_MAX) throw new Error(`the content is over the ${AVATAR_CONTENT_MAX}-byte limit once mined`)
   return { pre, post, lead }
 }
 
@@ -204,6 +222,8 @@ export class AvatarTailMiner {
     for (let off = 0; off < this.hashed; off += 64) compress(this.mid, this.W, head, off)
     const rem = head.subarray(this.hashed)
     this.remLen = rem.length
+    // Every try must be one block: the bytes before the digits, the digits, the end and the padding.
+    if (rem.length + AVATAR_NONCE_DIGITS_MAX + split.post.length + 9 > 64) throw new Error('this split does not leave one block per try')
     this.buf = new Uint8Array(rem.length + AVATAR_NONCE_DIGITS_MAX + 8 + split.post.length + 128)
     this.buf.set(rem)
     this.post = split.post

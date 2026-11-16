@@ -42,10 +42,11 @@ export const AVATAR_CONTENT_MAX = 131_072;
 /**
  * Above this many bytes of content a publishing client warns that some
  * remote signers (NIP-46) may refuse the event: older NIP-44 libraries
- * encrypt at most 65,535 bytes, and the request carries the whole event.
- * Spec 8.10, non-normative.
+ * encrypt at most 65,535 bytes, and the request carries the whole event
+ * with its content escaped again, so such a signer fails near 65,200
+ * bytes of content. Spec 8.10, non-normative.
  */
-export const AVATAR_CONTENT_WARN = 65_536;
+export const AVATAR_CONTENT_WARN = 64_000;
 /**
  * Replaceable: one avatar per pubkey, the newest wins, no `d` tag.
  *
@@ -60,12 +61,18 @@ export const AVATAR_CONTENT_WARN = 65_536;
 export const AVATAR_KIND = 11333;
 /** Ticks in a model unit, as the shard payload divides them. */
 const TICKS_PER_UNIT = 120;
-/** The ticks column unpacked to one triple per vertex. */
+/**
+ * The ticks column unpacked to one triple per vertex. Stops at `count`
+ * triples, so a run of a billion zero triples costs nothing.
+ */
 export function unpackTicks(packed, count) {
     const out = [];
     for (const item of packed ?? []) {
+        if (out.length >= count)
+            break;
         if (typeof item === 'number') {
-            for (let i = 0; i < -item; i++)
+            const n = Math.min(-item, count - out.length);
+            for (let i = 0; i < n; i++)
                 out.push([0, 0, 0]);
         }
         else
@@ -86,6 +93,26 @@ export function avatarReach(payload) {
     });
     return reach * 2 ** unit;
 }
+const isNum = (x) => typeof x === 'number' && Number.isFinite(x);
+const isTriple = (v) => Array.isArray(v) && v.slice(0, 3).every(isNum);
+/**
+ * Whether the work can be read from a payload at all (spec 8.10: content a
+ * client cannot read is not an avatar). `vertices` is a list of lists whose
+ * first three entries, where present, are numbers; `ticks`, where present,
+ * holds runs (whole numbers, zero or below) and such lists; `faces`, where
+ * present, is a list. Without this a coordinate that is not a number would
+ * price the avatar at NaN, which passes every comparison.
+ */
+export function avatarReadable(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+        return false;
+    const p = payload;
+    if (!Array.isArray(p.vertices) || !p.vertices.every(isTriple))
+        return false;
+    if (p.ticks != null && !(Array.isArray(p.ticks) && p.ticks.every((t) => (isNum(t) && t <= 0 && Number.isInteger(t)) || isTriple(t))))
+        return false;
+    return p.faces == null || Array.isArray(p.faces);
+}
 /** Vertices plus faces, before the free allowance. */
 export function avatarDetail(payload) {
     return payload.vertices.length + (payload.faces?.length ?? 0);
@@ -104,9 +131,10 @@ export function avatarBits(reach, detail) {
 export function avatarWork(payload) {
     return avatarBits(avatarReach(payload), avatarDetail(payload));
 }
-/** The content's length as the limit counts it: UTF-8 bytes. */
+const utf8 = new TextEncoder();
+/** The content's length as the limit counts it: UTF-8 bytes (a lone surrogate counts three). */
 export function avatarContentBytes(content) {
-    return new TextEncoder().encode(content).length;
+    return utf8.encode(content).length;
 }
 /** Leading zero bits of a hex string, as NIP-13 counts them. */
 export function leadingZeroBits(hex) {
@@ -138,13 +166,15 @@ export function verifyAvatarWork(event) {
     const zeros = leadingZeroBits(event.id);
     if (event.kind !== AVATAR_KIND)
         return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' };
-    if (event.content.length > AVATAR_CONTENT_MAX || avatarContentBytes(event.content) > AVATAR_CONTENT_MAX) {
+    // UTF-8 never takes fewer bytes than UTF-16 code units, and never more than three per unit.
+    const len = event.content.length;
+    if (len > AVATAR_CONTENT_MAX || (len * 3 > AVATAR_CONTENT_MAX && avatarContentBytes(event.content) > AVATAR_CONTENT_MAX)) {
         return { ok: false, required: 0, committed: null, zeros, reason: 'too-large' };
     }
     let payload;
     try {
         const raw = JSON.parse(event.content);
-        if (!raw || !Array.isArray(raw.vertices))
+        if (!avatarReadable(raw))
             return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' };
         payload = raw;
     }
@@ -152,6 +182,8 @@ export function verifyAvatarWork(event) {
         return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' };
     }
     const required = avatarWork(payload);
+    if (Number.isNaN(required))
+        return { ok: false, required: 0, committed: null, zeros, reason: 'not-an-avatar' };
     const nonce = event.tags.find((t) => t[0] === 'nonce');
     const committed = nonce && /^\d+$/.test(nonce[2] ?? '') ? Number(nonce[2]) : null;
     if (committed === null)

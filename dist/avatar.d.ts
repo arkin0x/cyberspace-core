@@ -42,10 +42,11 @@ export declare const AVATAR_CONTENT_MAX = 131072;
 /**
  * Above this many bytes of content a publishing client warns that some
  * remote signers (NIP-46) may refuse the event: older NIP-44 libraries
- * encrypt at most 65,535 bytes, and the request carries the whole event.
- * Spec 8.10, non-normative.
+ * encrypt at most 65,535 bytes, and the request carries the whole event
+ * with its content escaped again, so such a signer fails near 65,200
+ * bytes of content. Spec 8.10, non-normative.
  */
-export declare const AVATAR_CONTENT_WARN = 65536;
+export declare const AVATAR_CONTENT_WARN = 64000;
 /**
  * Replaceable: one avatar per pubkey, the newest wins, no `d` tag.
  *
@@ -68,10 +69,22 @@ export interface AvatarPayload {
     ticks?: Array<number[] | number>;
     faces?: unknown[];
 }
-/** The ticks column unpacked to one triple per vertex. */
+/**
+ * The ticks column unpacked to one triple per vertex. Stops at `count`
+ * triples, so a run of a billion zero triples costs nothing.
+ */
 export declare function unpackTicks(packed: Array<number[] | number> | undefined, count: number): number[][];
 /** The farthest any vertex reaches from the build origin, in gibsons at true scale. */
 export declare function avatarReach(payload: AvatarPayload): number;
+/**
+ * Whether the work can be read from a payload at all (spec 8.10: content a
+ * client cannot read is not an avatar). `vertices` is a list of lists whose
+ * first three entries, where present, are numbers; `ticks`, where present,
+ * holds runs (whole numbers, zero or below) and such lists; `faces`, where
+ * present, is a list. Without this a coordinate that is not a number would
+ * price the avatar at NaN, which passes every comparison.
+ */
+export declare function avatarReadable(payload: unknown): payload is AvatarPayload;
 /** Vertices plus faces, before the free allowance. */
 export declare function avatarDetail(payload: AvatarPayload): number;
 /**
@@ -82,7 +95,7 @@ export declare function avatarDetail(payload: AvatarPayload): number;
 export declare function avatarBits(reach: number, detail: number): number;
 /** The leading zero bits the avatar's event id must carry. */
 export declare function avatarWork(payload: AvatarPayload): number;
-/** The content's length as the limit counts it: UTF-8 bytes. */
+/** The content's length as the limit counts it: UTF-8 bytes (a lone surrogate counts three). */
 export declare function avatarContentBytes(content: string): number;
 /** Leading zero bits of a hex string, as NIP-13 counts them. */
 export declare function leadingZeroBits(hex: string): number;

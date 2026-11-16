@@ -39,14 +39,19 @@ export interface AvatarMineFound {
 /** Digits a try's nonce may have; the last block keeps room for them. */
 export declare const AVATAR_NONCE_DIGITS_MAX = 16;
 /**
- * The most bytes mining adds to the content: `,"nonce":"` and `"`, up to 63
- * leading zeros and AVATAR_NONCE_DIGITS_MAX digits. A content within
- * AVATAR_CONTENT_MAX less this always fits the limit once mined.
+ * The most bytes mining adds to a content that holds no nonce yet:
+ * `,"nonce":"` and `"` (11), the zeros that lead the digits (fewer than
+ * 64 - (64 - AVATAR_NONCE_DIGITS_MAX - POST_BYTES - 9), so at most 29) and
+ * AVATAR_NONCE_DIGITS_MAX digits: 56. A content within AVATAR_CONTENT_MAX
+ * less this always fits the limit once mined; avatarTailSplit refuses one
+ * that would not.
  */
 export declare const AVATAR_NONCE_ROOM: number;
 /**
- * The content with `nonce` as the last field of its payload; an earlier
- * `nonce` field is dropped. Throws when the content is not a JSON object.
+ * The content with `nonce` as the last field of its payload. A nonce this
+ * miner wrote before (the content ends with it) is cut off as text, so the
+ * rest stays byte for byte; any other `nonce` field is dropped by writing
+ * the payload again. Throws when the content is not a JSON object.
  */
 export declare function avatarTailContent(content: string, nonce: string): string;
 /**

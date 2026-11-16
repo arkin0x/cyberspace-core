@@ -63,6 +63,31 @@ describe('AvatarTailMiner', () => {
     expect(verifyAvatarWork({ ...r.event, id: r.found.id }).reason).toBe('under-committed')
     expect(JSON.parse(r.event.content).nonce).toBe(r.found.nonce)
   })
+  it('hashes right at every offset of the nonce in its block, with and without leading zeros', () => {
+    for (let len = 0; len < 130; len++) {
+      const t = { ...ship, tags: [['name', 'q'.repeat(len)]] }
+      const split = avatarTailSplit(t, 4)
+      const found = new AvatarTailMiner(split, len * 1000).run(1 << 12, 4)!
+      expect(idOf(avatarTailEvent(t, found.nonce, 4))).toBe(found.id)
+    }
+  })
+  it('refuses a split that would need more than one block per try', () => {
+    const split = avatarTailSplit(ship, 4)
+    expect(() => new AvatarTailMiner({ ...split, post: new Uint8Array(60) })).toThrow()
+  })
+  it('refuses to mine content that would be over the limit once mined', () => {
+    const prefix = '{"vertices":[[0,0,0]],"faces":[],"pad":"'
+    const body = `${prefix}${'a'.repeat(AVATAR_CONTENT_MAX - prefix.length - 2)}"}`
+    expect(() => avatarTailSplit({ ...ship, content: body }, 10)).toThrow(/limit/)
+  })
+  it('takes only safe starts, which keep every nonce within 16 digits for 10^15 tries', () => {
+    expect(() => new AvatarTailMiner(avatarTailSplit(ship, 4), 2 ** 53)).toThrow()
+    expect(() => new AvatarTailMiner(avatarTailSplit(ship, 4), Number.MAX_SAFE_INTEGER)).not.toThrow()
+  })
+  it('keeps a mined content byte for byte when mining it again', () => {
+    const odd = '{"vertices":[[0,0,0]],"scale":1.0,"tiny":1e-7,"b":1,"1":2,"nonce":"0042"}'
+    expect(avatarTailContent(odd, '7')).toBe('{"vertices":[[0,0,0]],"scale":1.0,"tiny":1e-7,"b":1,"1":2,"nonce":"7"}')
+  })
   it('refuses a target beyond what it reads and a bad start', () => {
     expect(() => new AvatarTailMiner(avatarTailSplit(ship, 10)).run(1, 65)).toThrow()
     expect(() => new AvatarTailMiner(avatarTailSplit(ship, 10), -1)).toThrow()
@@ -82,7 +107,7 @@ describe('avatarTailContent', () => {
     const prefix = '{"vertices":[[0,0,0]],"faces":[],"pad":"'
     const body = `${prefix}${'a'.repeat(AVATAR_CONTENT_MAX - AVATAR_NONCE_ROOM - prefix.length - 2)}"}`
     expect(avatarContentBytes(body)).toBe(AVATAR_CONTENT_MAX - AVATAR_NONCE_ROOM)
-    const worst = avatarTailContent(body, '0'.repeat(63) + '9'.repeat(16))
+    const worst = avatarTailContent(body, '0'.repeat(29) + '9'.repeat(16)) // the most zeros a lead can be, and 16 digits
     expect(avatarContentBytes(worst)).toBe(AVATAR_CONTENT_MAX)
   })
 })

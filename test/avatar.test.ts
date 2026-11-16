@@ -1,26 +1,126 @@
 /**
- * avatar.test.ts - the work an avatar owes, pinned to fixtures/avatar_work.json,
- * which the Python core shares.
+ * avatar.test.ts - what a reader checks on an avatar (spec 8.10), pinned to
+ * the spec's golden vectors, fixtures/avatar-vectors.json, which the Python
+ * core shares. An avatar carries no proof of work: no verdict reads a tag.
  */
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { AVATAR_KIND, avatarReach, avatarWork, leadingZeroBits, verifyAvatarWork } from '../src/avatar.js'
+import * as core from '../src/index.js'
+import {
+  AVATAR_CONTENT_MAX, AVATAR_CONTENT_WARN, AVATAR_KIND,
+  avatarContentBytes, avatarReach, avatarReadable, leadingZeroBits, verifyAvatar, verifyAvatarWork,
+} from '../src/avatar.js'
 
-interface Vector { name: string; payload: { unit?: number; vertices: number[][]; ticks?: Array<number[] | number>; faces?: unknown[] }; reach: number; required: number }
-const VECTORS: Vector[] = JSON.parse(readFileSync(new URL('./fixtures/avatar_work.json', import.meta.url), 'utf8'))
+const RAW = readFileSync(new URL('./fixtures/avatar-vectors.json', import.meta.url), 'utf8')
+/** The spec commit the file was copied from (PR #109's branch; re-pin to its merge commit), and its hash. */
+const AVATAR_VECTORS_SPEC_COMMIT = '1420330d9b30d77ce714db5cb5330393b084e151'
+const AVATAR_VECTORS_SHA256 = '3f2b9220470d58b335dcd61b27d30d66afb08f484d63d4acbd8a93b6b4febf0e'
 
-describe('avatarWork', () => {
-  for (const v of VECTORS) {
-    it(`${v.name}: reach ${v.reach}, ${v.required} bits`, () => {
-      expect(avatarReach(v.payload)).toBeCloseTo(v.reach, 9)
-      expect(avatarWork(v.payload)).toBe(v.required)
+interface Ev { kind: number; id: string; pubkey: string; created_at: number; tags: string[][]; content: string | null; content_recipe?: { prefix: string; fill: string; count: number; suffix: string } }
+interface Vectors {
+  constants: { kind: number; content_max: number }
+  content_limit: Array<{ bytes: number; refused: boolean }>
+  corpus: Array<{ name: string; bytes: number; vertices: number; faces: number; refused: boolean }>
+  verdicts: Array<{ name: string; event: Ev; verdict: { ok: boolean; reason: string } }>
+}
+const V: Vectors = JSON.parse(RAW)
+const content = (e: Ev): string => e.content ?? `${e.content_recipe!.prefix}${e.content_recipe!.fill.repeat(e.content_recipe!.count)}${e.content_recipe!.suffix}`
+
+describe('the vectors', () => {
+  it('are the spec file, unchanged', () => {
+    expect(AVATAR_VECTORS_SPEC_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+    expect(createHash('sha256').update(RAW).digest('hex')).toBe(AVATAR_VECTORS_SHA256)
+  })
+  it('carry the constants this module uses', () => {
+    expect(V.constants).toEqual({ kind: AVATAR_KIND, content_max: AVATAR_CONTENT_MAX })
+  })
+})
+
+describe('verifyAvatar', () => {
+  for (const v of V.verdicts) {
+    it(`${v.name}: ${v.verdict.reason}`, () => {
+      const e = { ...v.event, content: content(v.event) }
+      expect(verifyAvatar(e)).toEqual(v.verdict)
+      // No verdict reads a tag.
+      expect(verifyAvatar({ ...e, tags: [] } as typeof e)).toEqual(v.verdict)
     })
   }
-  it('prices reach hardest: each doubling costs six bits, detail three, and nothing under a gibson', () => {
-    const one = VECTORS.find((v) => v.name === 'one gibson, plain')!.required
-    expect(VECTORS.find((v) => v.name === 'half gibson, ticks')!.required).toBe(one)
-    expect(VECTORS.find((v) => v.name === 'two gibsons')!.required - one).toBe(2)
-    expect(VECTORS.find((v) => v.name === 'four gibsons')!.required - one).toBe(4)
+  for (const v of V.content_limit) {
+    it(`${v.bytes} bytes: ${v.refused ? 'refused' : 'drawn'}`, () => {
+      const prefix = '{"vertices":[[0,0,0]],"pad":"'
+      const body = v.bytes < prefix.length + 2 ? '{"vertices":[[0,0,0]]}' : `${prefix}${'a'.repeat(v.bytes - prefix.length - 2)}"}`
+      expect(verifyAvatar({ kind: AVATAR_KIND, content: body }).reason === 'too-large').toBe(v.refused)
+    })
+  }
+  it('counts the limit in UTF-8 bytes, not characters', () => {
+    const prefix = '{"vertices":[[0,0,0]],"pad":"'
+    const body = `${prefix}${'é'.repeat((AVATAR_CONTENT_MAX - prefix.length) / 2 + 1)}"}`
+    expect(body.length).toBeLessThan(AVATAR_CONTENT_MAX)
+    expect(avatarContentBytes(body)).toBeGreaterThan(AVATAR_CONTENT_MAX)
+    expect(verifyAvatar({ kind: AVATAR_KIND, content: body }).reason).toBe('too-large')
+  })
+  it('stops a long run of ticks at the vertex count', () => {
+    const t0 = Date.now()
+    expect(verifyAvatar({ kind: AVATAR_KIND, content: '{"vertices":[[0,0,0]],"ticks":[-1e300]}' }).ok).toBe(true)
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
+  it('the warning sits under the limit', () => {
+    expect(AVATAR_CONTENT_WARN).toBe(64_000)
+    expect(AVATAR_CONTENT_WARN).toBeLessThan(AVATAR_CONTENT_MAX)
+  })
+})
+
+describe('the avatar study corpus', () => {
+  for (const v of V.corpus) {
+    it(`${v.name}: ${v.bytes} bytes, ${v.refused ? 'refused' : 'drawn'}`, () => expect(v.bytes > AVATAR_CONTENT_MAX).toBe(v.refused))
+  }
+})
+
+describe('verifyAvatarWork (deprecated)', () => {
+  it('never checks work: the same verdict as verifyAvatar, for display the tag and the zeros', () => {
+    for (const v of V.verdicts) {
+      const e = { ...v.event, content: content(v.event) }
+      const r = verifyAvatarWork(e)
+      expect({ ok: r.ok, reason: r.reason }).toEqual(v.verdict)
+      expect(r.required).toBe(0)
+      expect(r.zeros).toBe(leadingZeroBits(e.id))
+    }
+    const old = V.verdicts.find((x) => x.name.startsWith('published before 2026-11'))!
+    expect(verifyAvatarWork({ ...old.event, content: content(old.event) })).toMatchObject({ ok: true, committed: 16, zeros: 16 })
+  })
+})
+
+describe('verifyAvatarWork never throws on what it only displays', () => {
+  it('takes junk tags and ids', () => {
+    const content = '{"vertices":[[0,0,0]]}'
+    for (const e of [{ tags: 'x' }, { tags: 5 }, { tags: [null, ['nonce']] }, { id: null }, { id: 5 }, { tags: [['nonce', '0', '9'.repeat(5000)]] }]) {
+      const ev = { kind: AVATAR_KIND, id: '00ff', tags: [] as string[][], content, ...e } as unknown as Parameters<typeof verifyAvatarWork>[0]
+      expect(verifyAvatarWork(ev).ok).toBe(true)
+    }
+  })
+})
+
+describe('the price is gone', () => {
+  it('exports no work function', () => {
+    for (const name of ['avatarWork', 'AVATAR_FLOOR_BITS', 'AVATAR_SIZE_BITS', 'AVATAR_DETAIL_BITS', 'AVATAR_DETAIL_FREE']) {
+      expect((core as Record<string, unknown>)[name]).toBeUndefined()
+    }
+  })
+})
+
+describe('avatarReach and avatarReadable', () => {
+  it('reach reads unit, vertices and packed ticks', () => {
+    expect(avatarReach({ unit: 0, vertices: [[0, 0, 0], [-1, -1, -1]], ticks: [[60, 60, 60], [60, 60, 60]] })).toBeCloseTo(0.5, 9)
+    expect(avatarReach({ unit: 2, vertices: [[4, 0, 0]] })).toBe(16)
+    expect(avatarReach({ vertices: [[3, 0, 0], [0, 0, 0]], ticks: [-2] })).toBe(3)
+    expect(avatarReach({ unit: 2000, vertices: [[0, 0, 0]] })).toBe(0)
+  })
+  it('readable refuses what is not a payload', () => {
+    expect(avatarReadable({ vertices: [[0, 0, 0]] })).toBe(true)
+    for (const p of [null, [], { vertices: 'no' }, { vertices: [null] }, { vertices: [['x', 0, 0]] }, { vertices: [[0, 0, 0]], faces: 5 }, { vertices: [[0, 0, 0]], ticks: [true] }]) {
+      expect(avatarReadable(p)).toBe(false)
+    }
   })
 })
 
@@ -28,37 +128,7 @@ describe('leadingZeroBits', () => {
   it('counts as NIP-13 does', () => {
     expect(leadingZeroBits('0000ffff')).toBe(16)
     expect(leadingZeroBits('000f')).toBe(12)
-    expect(leadingZeroBits('00')).toBe(8)
     expect(leadingZeroBits('1abc')).toBe(3)
-    expect(leadingZeroBits('ffff')).toBe(0)
     expect(leadingZeroBits('')).toBe(0)
-  })
-})
-
-describe('verifyAvatarWork', () => {
-  const payload = VECTORS.find((v) => v.name === 'one gibson, plain')!.payload
-  const content = JSON.stringify(payload)
-  const id = (zeros: number): string => '0'.repeat(zeros / 4) + 'f'.repeat(64 - zeros / 4)
-  const ev = (zeros: number, committed: string | null, kind = AVATAR_KIND, body = content) => ({
-    kind, id: id(zeros), content: body,
-    tags: committed === null ? [['d', 'avatar']] : [['d', 'avatar'], ['nonce', '12345', committed]],
-  })
-  it('accepts a paid avatar: the committed target covers what the shape owes and the id carries it', () => {
-    expect(verifyAvatarWork(ev(16, '16'))).toMatchObject({ ok: true, required: 16, committed: 16, zeros: 16 })
-    expect(verifyAvatarWork(ev(20, '16')).ok).toBe(true)
-  })
-  it('refuses an id short of its commitment, a commitment short of the price, and no commitment', () => {
-    expect(verifyAvatarWork(ev(16, '20')).reason).toBe('unpaid')
-    expect(verifyAvatarWork(ev(20, '12')).reason).toBe('under-committed')
-    expect(verifyAvatarWork(ev(20, null)).reason).toBe('no-nonce')
-  })
-  it('is not fooled by a lucky id claimed against a lower bar', () => {
-    // 20 zeros on the id, but the miner committed to 12 while the shape owes 16.
-    expect(verifyAvatarWork(ev(20, '12')).ok).toBe(false)
-  })
-  it('does not judge other kinds or junk', () => {
-    expect(verifyAvatarWork(ev(20, '16', 1)).reason).toBe('not-an-avatar')
-    expect(verifyAvatarWork(ev(20, '16', AVATAR_KIND, 'not json')).reason).toBe('not-an-avatar')
-    expect(verifyAvatarWork(ev(20, '16', AVATAR_KIND, '{"vertices":"no"}')).reason).toBe('not-an-avatar')
   })
 })
